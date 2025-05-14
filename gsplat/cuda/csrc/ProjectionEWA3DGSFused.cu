@@ -3,6 +3,7 @@
 #include <ATen/cuda/Atomic.cuh>
 #include <c10/cuda/CUDAStream.h>
 #include <cooperative_groups.h>
+#include <cooperative_groups/memcpy_async.h>  // required for labeled_partition
 
 #include "Common.h"
 #include "Projection.h"
