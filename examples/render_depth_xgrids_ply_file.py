@@ -14,7 +14,7 @@ import pandas as pd
 import cv2
 from torchvision.transforms import ToTensor
 from scipy.spatial.transform import Rotation as R
-
+import open3d as o3d
 
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
@@ -191,6 +191,50 @@ class GaussianModel:
         return render_colors, render_alphas, info
 
 
+# def normalize_depth(depth, max_depth=5.0):
+#     """Normalize depth for visualization"""
+#     depth = np.clip(depth, 0, max_depth)
+#     depth_vis = (depth / max_depth * 255).astype(np.uint8)
+#     return cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
+
+def normalize_depth(depth: np.ndarray) -> np.ndarray:
+    depth_min = depth.min()
+    depth_max = depth.max()
+    norm = (depth - depth_min) / (depth_max - depth_min + 1e-8)
+    depth_vis = (norm * 255).astype(np.uint8)
+    return cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
+
+def render_rgbd_from_obj(obj_path, cam_intrinsics, cam_pose, width, height):
+    mesh = o3d.io.read_triangle_mesh(obj_path)
+    if mesh.is_empty():
+        raise ValueError(f"Failed to load mesh from {obj_path}")
+
+    mesh.compute_vertex_normals()
+
+    renderer = o3d.visualization.rendering.OffscreenRenderer(width, height)
+    renderer.scene.set_background([0, 0, 0, 1])
+
+    material = o3d.visualization.rendering.MaterialRecord()
+    material.shader = "defaultLit"
+    renderer.scene.add_geometry("mesh", mesh, material)
+
+    intrinsic = o3d.camera.PinholeCameraIntrinsic()
+    intrinsic.set_intrinsics(width, height, *cam_intrinsics)
+
+    # extrinsic = np.linalg.inv(cam_pose.cpu().numpy()).astype(np.float32)
+    # renderer.setup_camera(intrinsic, extrinsic)
+    
+    extrinsic = np.linalg.inv(cam_pose.squeeze(0).cpu().numpy()).astype(np.float64)
+    renderer.setup_camera(intrinsic, extrinsic)
+
+    color = renderer.render_to_image()
+    depth = renderer.render_to_depth_image(z_in_view_space=False)
+
+    color_np = np.asarray(color)
+    depth_np = np.asarray(depth)
+
+    return color_np, depth_np
+
 def pose_to_camtoworld(tx, ty, tz, qx, qy, qz, qw):
     # Convert quaternion to rotation matrix
     r = R.from_quat([qx, qy, qz, qw])
@@ -207,33 +251,17 @@ def main():
     # parser.add_argument("--ply_path", type=str, help="Path to ply file")
     # args = parser.parse_args()
 
-    # Load trajectory
-    img_traj_path = "/root/code/datasets/ARTGarage/xgrids/1/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/img_traj.csv"
-    df = pd.read_csv(img_traj_path, comment="#", delim_whitespace=True,
-                 names=["timestamp", "imgname", "tx", "ty", "tz", "qx", "qy", "qz", "qw"])
-
-
-    ply_path="/root/code/datasets/ARTGarage/xgrids/4/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply"
-
-    gaussian_model = GaussianModel(3)
-
-    # Load configuration
-    gaussian_model.load_ply(ply_path)
+    # # R: 3x3 rotation, t: 3x1 translation
+    # R = torch.eye(3).to("cuda")
+    # t = torch.tensor([0, 0, 0], dtype=torch.float32).to("cuda")
+    # T = torch.eye(4, device="cuda")
+    # T[:3, :3] = R.T  # Transpose of R
+    # T[:3, 3] = (-R.T @ t).flatten()
+    # camtoworlds = T.unsqueeze(0)  # Shape: [1, 4, 4]
 
     H, W = 1080, 1920
     fx = fy = 1080
-
-
-    # R: 3x3 rotation, t: 3x1 translation
-    R = torch.eye(3).to("cuda")
-    t = torch.tensor([0, 0, 0], dtype=torch.float32).to("cuda")
-    T = torch.eye(4, device="cuda")
-    T[:3, :3] = R.T  # Transpose of R
-    T[:3, 3] = (-R.T @ t).flatten()
-    camtoworlds = T.unsqueeze(0)  # Shape: [1, 4, 4]
-
     cx, cy = W/2, H/2
-
     Ks = torch.tensor([[fx, 0.0, cx],
            [0.0, fy, cy],
            [0.0,  0.0,  1.0]], dtype=torch.float32).to("cuda")
@@ -243,28 +271,47 @@ def main():
     image_ids = torch.tensor([0], dtype=torch.long)  # Shape: [1]
     masks = torch.ones((1, H, W, 4), dtype=torch.bool)  # Shape: [1, 1080, 1920, 4]
 
+    ply_path="/root/code/datasets/ARTGarage/xgrids/4/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply"
+
+    gaussian_model = GaussianModel(3)
+
+    # Load configuration
+    gaussian_model.load_ply(ply_path)
+
+    # Load trajectory
+    pose_file =  "panoramicPoses.csv" # "img_traj.csv" "poses.csv"
+
+    img_traj_path = f"/root/code/datasets/ARTGarage/xgrids/1/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/{pose_file}"
+    df = pd.read_csv(img_traj_path, comment="#", sep='\s+',
+                 names=["timestamp", "imgname", "tx", "ty", "tz", "qx", "qy", "qz", "qw"])
+
+    # df = pd.read_csv(img_traj_path, comment="#", sep='\s+',
+    #              names=["timestamp", "tx", "ty", "tz", "qx", "qy", "qz", "qw"])
+
     # Define output path
     video_path = "/root/code/datasets/ARTGarage/xgrids/rendered_comparison.mp4"
 
     # Define video writer (assumes 1920x1080 images → adjust if needed)
     frame_h, frame_w = H, W
-    output_size = (frame_w * 2, frame_h)  # side-by-side: RGB | Depth
+    output_size = (frame_w * 2, frame_h * 2)  # side-by-side: RGB | Depth
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video_writer = cv2.VideoWriter(video_path, fourcc, 24.0, output_size)
+    fps=0.5
+    video_writer = cv2.VideoWriter(video_path, fourcc, fps, output_size)
 
     for idx, row in df.iterrows():
-        imgname = row["imgname"]
-        img_path = f"/root/code/datasets/ARTGarage/xgrids/1/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/images/{imgname}"
-        print(img_path)
-        gt_img = cv2.imread(img_path)
-        gt_img_rgb = cv2.cvtColor(gt_img, cv2.COLOR_BGR2RGB)
-        gt_tensor = ToTensor()(gt_img_rgb).permute(1, 2, 0).unsqueeze(0).to("cuda")  # [1, H, W, 3]
+        if idx > 30:
+            break
+        # imgname = row["imgname"][:-4]
+        # img_path = f"/root/code/datasets/ARTGarage/xgrids/1/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/perspective/images/{imgname}_2.jpg"
+        # gt_img = cv2.imread(img_path)
+        # gt_img_rgb = cv2.cvtColor(gt_img, cv2.COLOR_BGR2RGB)
+        # gt_tensor = ToTensor()(gt_img_rgb).permute(1, 2, 0).unsqueeze(0).to("cuda")  # [1, H, W, 3]
 
         # Camera pose
         camtoworlds = pose_to_camtoworld(row.tx, row.ty, row.tz, row.qx, row.qy, row.qz, row.qw)
 
 
-        # forward
+        # 3DGS Renderings
         renders, alphas, info = gaussian_model.rasterize_splats(
             camtoworlds=camtoworlds,
             Ks=Ks,
@@ -280,39 +327,72 @@ def main():
         colors, depths = renders[..., 0:3], renders[..., 3:4]
 
         # # Convert to CPU and numpy
-        # rgb_img = colors[0].clamp(0, 1).detach().cpu().numpy()  # [H, W, 3]
-        # depth_img = depths[0].squeeze(-1).detach().cpu().numpy()  # [H, W]
+        rendered_rgb_3dgs = colors[0].clamp(0, 1).detach().cpu().numpy()  # [H, W, 3]
+        rendered_depth_3dgs = depths[0].detach().cpu().numpy()  # [H, W]
 
-        # # Normalize depth for display
-        # depth_img_norm = (depth_img - depth_img.min()) / (depth_img.max() - depth_img.min() + 1e-8)
+        # === Convert to displayable format ===
+        rgb_vis_3dgs = (rendered_rgb_3dgs * 255).astype(np.uint8)
+        rgb_vis_3dgs = cv2.cvtColor(rgb_vis_3dgs, cv2.COLOR_RGB2BGR)
+        depth_vis_3dgs = normalize_depth(rendered_depth_3dgs)
+        
+
+        # OBJ File Renderings
+        obj_file = "/root/code/datasets/ARTGarage/xgrids/4/Gaussian/Mesh_Files/art_garage_sample.obj"
+        #obj_file = "/root/code/datasets/ARTGarage/xgrids/4/Mesh_textured/texture/block0.obj"
+        cam_intrinsics = [fx, fy, cx, cy]
+        rgb_obj, depth_obj = render_rgbd_from_obj(obj_file, cam_intrinsics, camtoworlds, W, H)
+    
+        # Ensure OBJ RGB is BGR
+        rgb_vis_obj = cv2.cvtColor(rgb_obj, cv2.COLOR_RGB2BGR)
+        # Normalize OBJ depth for visualization
+        depth_vis_obj = normalize_depth(depth_obj)
+
+
+
+        cv2.putText(rgb_vis_3dgs, "GS RGB", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+        cv2.putText(rgb_vis_obj,  "OBJ RGB", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+        cv2.putText(depth_vis_3dgs, "GS Depth", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+        cv2.putText(depth_vis_obj,  "OBJ Depth", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+
+        # Top row: RGB images
+        top_row = np.hstack([rgb_vis_3dgs, rgb_vis_obj])
+
+        # Bottom row: Depth images
+        bottom_row = np.hstack([depth_vis_3dgs, depth_vis_obj])
+
+        # Final 2x2 grid
+        grid_frame = np.vstack([top_row, bottom_row])  # [2H, 2W, 3]
+
+        video_writer.write(grid_frame)
+
 
         # # Show images
-        # plt.subplot(1, 2, 1)
-        # plt.imshow(rgb_img)
-        # plt.title("Rendered RGB")
+        # plt.subplot(2, 2, 1)
+        # plt.imshow(rgb_vis_3dgs)
+        # plt.title("Rendered RGB 3DGS")
 
-        # plt.subplot(1, 2, 2)
-        # plt.imshow(depth_img_norm, cmap='inferno')
-        # plt.title("Rendered Depth")
+
+        # plt.subplot(2, 2, 2)
+        # plt.imshow(depth_vis_3dgs, cmap='inferno')
+        # plt.title("Rendered Depth 3DGS")
+
+        # plt.subplot(2, 2, 3)
+        # plt.imshow(rgb_vis_obj)
+        # plt.title("GT RGB")
+
+        # plt.subplot(2, 2, 3)
+        # plt.imshow(gt_img_rgb)
+        # plt.title("OBJ RGB")
+
+        # plt.subplot(2, 2, 4)
+        # plt.imshow(depth_vis_obj, cmap='inferno')
+        # plt.title("Rendered Depth OBJ")
 
         # plt.show()
-        rendered_rgb = renders[..., :3][0].clamp(0, 1).detach().cpu().numpy()  # [H, W, 3]
-        rendered_depth = renders[..., 3][0].detach().cpu().numpy()  # [H, W]
-        # === Convert to displayable format ===
-        rgb_vis = (rendered_rgb * 255).astype(np.uint8)
-        rgb_vis = cv2.cvtColor(rgb_vis, cv2.COLOR_RGB2BGR)
-        depth_norm = (rendered_depth - rendered_depth.min()) / (rendered_depth.max() - rendered_depth.min() + 1e-8)
-        depth_vis = (depth_norm * 255).astype(np.uint8)
-        depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)  # [H, W, 3]
 
-        # === Concatenate and write to video ===
-        combined = np.concatenate((rgb_vis, depth_vis), axis=1)  # [H, 2*W, 3]
-        video_writer.write(combined)
 
     video_writer.release()
     print(f"✅ Video saved at: {video_path}")
-
-
 
 if __name__ == "__main__":
     main()
