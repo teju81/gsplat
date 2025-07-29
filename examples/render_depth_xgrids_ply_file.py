@@ -242,8 +242,8 @@ def pose_to_camtoworld(tx, ty, tz, qx, qy, qz, qw):
     t_vec = torch.tensor([tx, ty, tz], dtype=torch.float32)
 
     T = torch.eye(4, dtype=torch.float32)
-    T[:3, :3] = R_mat.T  # inverse rotation
-    T[:3, 3] = (-R_mat.T @ t_vec)  # inverse translation
+    T[:3, :3] = R_mat
+    T[:3, 3] = (R_mat @ t_vec)
     return T.unsqueeze(0).to("cuda")  # shape: [1, 4, 4]
 
 def main():
@@ -279,7 +279,7 @@ def main():
     gaussian_model.load_ply(ply_path)
 
     # Load trajectory
-    pose_file =  "panoramicPoses.csv" # "img_traj.csv" "poses.csv"
+    pose_file =  "img_traj.csv" # "panoramicPoses.csv" "img_traj.csv" "poses.csv"
 
     img_traj_path = f"/root/code/datasets/ARTGarage/xgrids/1/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/{pose_file}"
     df = pd.read_csv(img_traj_path, comment="#", sep='\s+',
@@ -299,8 +299,8 @@ def main():
     video_writer = cv2.VideoWriter(video_path, fourcc, fps, output_size)
 
     for idx, row in df.iterrows():
-        if idx > 30:
-            break
+        # if idx > 30:
+        #     break
         # imgname = row["imgname"][:-4]
         # img_path = f"/root/code/datasets/ARTGarage/xgrids/1/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/perspective/images/{imgname}_2.jpg"
         # gt_img = cv2.imread(img_path)
