@@ -154,16 +154,15 @@ class GaussianModel:
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         means = self._xyz  # [N, 3]
-        # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
-        # rasterization does normalization internally
-        quats = self._quats  # [N, 4]
+        quats = self._rotation  # [N, 4]
+
         scales = torch.exp(self._scaling)  # [N, 3]
         opacities = torch.sigmoid(self._opacity)  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
 
         colors = torch.cat((self._features_dc, self._features_rest), 1)  # [N, K, 3]
-        rasterize_mode = "classic"
+        rasterize_mode = "antialiased"
         camera_model = 'pinhole'
 
         render_colors, render_alphas, info = rasterization(
@@ -197,12 +196,12 @@ class GaussianModel:
 #     depth_vis = (depth / max_depth * 255).astype(np.uint8)
 #     return cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
 
-def normalize_depth(depth: np.ndarray) -> np.ndarray:
-    depth_min = depth.min()
-    depth_max = depth.max()
+def normalize_depth(depth: np.ndarray, depth_min=0.0, depth_max=30.0) -> np.ndarray:
     norm = (depth - depth_min) / (depth_max - depth_min + 1e-8)
     depth_vis = (norm * 255).astype(np.uint8)
-    return cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
+    #return cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
+    return cv2.cvtColor(depth_vis, cv2.COLOR_GRAY2BGR)  # convert to 3-channel BGR for OpenCV annotation
+
 
 def render_rgbd_from_obj(obj_path, cam_intrinsics, cam_pose, width, height):
     mesh = o3d.io.read_triangle_mesh(obj_path)
@@ -228,7 +227,7 @@ def render_rgbd_from_obj(obj_path, cam_intrinsics, cam_pose, width, height):
     renderer.setup_camera(intrinsic, extrinsic)
 
     color = renderer.render_to_image()
-    depth = renderer.render_to_depth_image(z_in_view_space=False)
+    depth = renderer.render_to_depth_image(z_in_view_space=True)
 
     color_np = np.asarray(color)
     depth_np = np.asarray(depth)
@@ -246,10 +245,38 @@ def pose_to_camtoworld(tx, ty, tz, qx, qy, qz, qw):
     T[:3, 3] = (R_mat @ t_vec)
     return T.unsqueeze(0).to("cuda")  # shape: [1, 4, 4]
 
+
+def on_mouse_click(event, x, y, flags, param):
+    if event == cv2.EVENT_LBUTTONDOWN:
+        window, img, depth = param  # Unpack color/depth flag
+        val = depth[y, x]
+        text = f"({x}, {y}): {val:.3f}"
+        cv2.putText(img, text, (x+10, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+        cv2.imshow(window, img)
+
+def quadrant_callback(event, x, y, flags, param):
+    rgb1, rgb2, depth1, depth2, depth_3dgs_rescale, depth_obj_rescale = param
+    h, w, _ = rgb1.shape
+    if y < h and x < w:
+        on_mouse_click(event, x, y, flags, ("Renderings", rgb1, depth_3dgs_rescale))
+    elif y < h and x >= w:
+        on_mouse_click(event, x - w, y, flags, ("Renderings", rgb2, depth_3dgs_rescale))
+    elif y >= h and x < w:
+        on_mouse_click(event, x, y - h, flags, ("Renderings", depth1, depth_obj_rescale))
+    elif y >= h and x >= w:
+        on_mouse_click(event, x - w, y - h, flags, ("Renderings", depth2, depth_obj_rescale))
+    # re-render grid with updated images
+    grid = np.vstack([np.hstack([rgb1, rgb2]), np.hstack([depth1, depth2])])
+    cv2.imshow("Renderings", grid)
+
+
 def main():
-    # parser = argparse.ArgumentParser(description="Load trained Gaussian Splat stored as a ply file and render RGBD images.")
-    # parser.add_argument("--ply_path", type=str, help="Path to ply file")
-    # args = parser.parse_args()
+    parser = argparse.ArgumentParser(description="Load trained Gaussian Splat stored as a ply file and render RGBD images.")
+    parser.add_argument("--ply_path", type=str, default="/root/code/datasets/artgarage/xgrids/4/02_Output/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply", 
+            help="Path to ply file")
+    parser.add_argument("--render_video", type=bool, default=False, help="Render Video or Images")
+    args = parser.parse_args()
+
 
     # # R: 3x3 rotation, t: 3x1 translation
     # R = torch.eye(3).to("cuda")
@@ -271,7 +298,7 @@ def main():
     image_ids = torch.tensor([0], dtype=torch.long)  # Shape: [1]
     masks = torch.ones((1, H, W, 4), dtype=torch.bool)  # Shape: [1, 1080, 1920, 4]
 
-    ply_path="/root/code/datasets/ARTGarage/xgrids/4/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply"
+    ply_path="/root/code/datasets/artgarage/xgrids/4/02_Output/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply"
 
     gaussian_model = GaussianModel(3)
 
@@ -281,28 +308,34 @@ def main():
     # Load trajectory
     pose_file =  "img_traj.csv" # "panoramicPoses.csv" "img_traj.csv" "poses.csv"
 
-    img_traj_path = f"/root/code/datasets/ARTGarage/xgrids/1/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/{pose_file}"
+    img_traj_path = f"/root/code/datasets/artgarage/xgrids/3/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/{pose_file}"
     df = pd.read_csv(img_traj_path, comment="#", sep='\s+',
                  names=["timestamp", "imgname", "tx", "ty", "tz", "qx", "qy", "qz", "qw"])
 
     # df = pd.read_csv(img_traj_path, comment="#", sep='\s+',
     #              names=["timestamp", "tx", "ty", "tz", "qx", "qy", "qz", "qw"])
 
-    # Define output path
-    video_path = "/root/code/datasets/ARTGarage/xgrids/rendered_comparison.mp4"
 
-    # Define video writer (assumes 1920x1080 images → adjust if needed)
-    frame_h, frame_w = H, W
-    output_size = (frame_w * 2, frame_h * 2)  # side-by-side: RGB | Depth
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    fps=0.5
-    video_writer = cv2.VideoWriter(video_path, fourcc, fps, output_size)
+    if args.render_video:
+
+        # Define output path
+        video_path = "/root/code/datasets/artgarage/xgrids/rendered_comparison.mp4"
+
+        # Define video writer (assumes 1920x1080 images → adjust if needed)
+        frame_h, frame_w = H, W
+        output_size = (frame_w * 2, frame_h * 2)  # side-by-side: RGB | Depth
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        fps=0.5
+        video_writer = cv2.VideoWriter(video_path, fourcc, fps, output_size)
+    else:
+        display_w, display_h = 1920, 1080
+        tile_w, tile_h = display_w // 2, display_h // 2
 
     for idx, row in df.iterrows():
-        # if idx > 30:
-        #     break
+        if idx > 30:
+            break
         # imgname = row["imgname"][:-4]
-        # img_path = f"/root/code/datasets/ARTGarage/xgrids/1/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/perspective/images/{imgname}_2.jpg"
+        # img_path = f"/root/code/datasets/artgarage/xgrids/3/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/perspective/images/{imgname}_2.jpg"
         # gt_img = cv2.imread(img_path)
         # gt_img_rgb = cv2.cvtColor(gt_img, cv2.COLOR_BGR2RGB)
         # gt_tensor = ToTensor()(gt_img_rgb).permute(1, 2, 0).unsqueeze(0).to("cuda")  # [1, H, W, 3]
@@ -318,27 +351,27 @@ def main():
             width=W,
             height=H,
             sh_degree=3,
-            near_plane=0.01,
-            far_plane=10000000000.0,
+            near_plane=0.001,
+            far_plane=30.0,
             image_ids=image_ids,
-            render_mode="RGB+ED",
+            render_mode="RGB+D",
             masks=masks,
         )
         colors, depths = renders[..., 0:3], renders[..., 3:4]
 
         # # Convert to CPU and numpy
         rendered_rgb_3dgs = colors[0].clamp(0, 1).detach().cpu().numpy()  # [H, W, 3]
-        rendered_depth_3dgs = depths[0].detach().cpu().numpy()  # [H, W]
+        rendered_depth_3dgs = depths[0].squeeze(2).detach().cpu().numpy()  # [H, W]
 
         # === Convert to displayable format ===
         rgb_vis_3dgs = (rendered_rgb_3dgs * 255).astype(np.uint8)
         rgb_vis_3dgs = cv2.cvtColor(rgb_vis_3dgs, cv2.COLOR_RGB2BGR)
-        depth_vis_3dgs = normalize_depth(rendered_depth_3dgs)
+        depth_vis_3dgs = normalize_depth(rendered_depth_3dgs, rendered_depth_3dgs.min(), rendered_depth_3dgs.max())
         
 
         # OBJ File Renderings
-        obj_file = "/root/code/datasets/ARTGarage/xgrids/4/Gaussian/Mesh_Files/art_garage_sample.obj"
-        #obj_file = "/root/code/datasets/ARTGarage/xgrids/4/Mesh_textured/texture/block0.obj"
+        obj_file = "/root/code/datasets/artgarage/xgrids/4/02_Output/Gaussian/Mesh_Files/art_garage_sample.obj"
+        #obj_file = "/root/code/datasets/artgarage/xgrids/4/02_Output/Mesh_textured/texture/block0.obj"
         cam_intrinsics = [fx, fy, cx, cy]
         rgb_obj, depth_obj = render_rgbd_from_obj(obj_file, cam_intrinsics, camtoworlds, W, H)
     
@@ -348,51 +381,77 @@ def main():
         depth_vis_obj = normalize_depth(depth_obj)
 
 
+        if args.render_video:
 
-        cv2.putText(rgb_vis_3dgs, "GS RGB", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
-        cv2.putText(rgb_vis_obj,  "OBJ RGB", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
-        cv2.putText(depth_vis_3dgs, "GS Depth", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
-        cv2.putText(depth_vis_obj,  "OBJ Depth", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+            cv2.putText(rgb_vis_3dgs, "GS RGB", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+            cv2.putText(rgb_vis_obj,  "OBJ RGB", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+            cv2.putText(depth_vis_3dgs, "GS Depth", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+            cv2.putText(depth_vis_obj,  "OBJ Depth", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
 
-        # Top row: RGB images
-        top_row = np.hstack([rgb_vis_3dgs, rgb_vis_obj])
+            # Top row: RGB images
+            top_row = np.hstack([rgb_vis_3dgs, rgb_vis_obj])
 
-        # Bottom row: Depth images
-        bottom_row = np.hstack([depth_vis_3dgs, depth_vis_obj])
+            # Bottom row: Depth images
+            bottom_row = np.hstack([depth_vis_3dgs, depth_vis_obj])
 
-        # Final 2x2 grid
-        grid_frame = np.vstack([top_row, bottom_row])  # [2H, 2W, 3]
+            # Final 2x2 grid
+            grid_frame = np.vstack([top_row, bottom_row])  # [2H, 2W, 3]
 
-        video_writer.write(grid_frame)
+            video_writer.write(grid_frame)
+        else:
 
+            rgb1 = cv2.resize(rgb_vis_3dgs, (tile_w, tile_h))
+            rgb2 = cv2.resize(rgb_vis_obj, (tile_w, tile_h))
+            depth1 = cv2.resize(depth_vis_3dgs, (tile_w, tile_h))
+            depth2 = cv2.resize(depth_vis_obj, (tile_w, tile_h))
 
-        # # Show images
-        # plt.subplot(2, 2, 1)
-        # plt.imshow(rgb_vis_3dgs)
-        # plt.title("Rendered RGB 3DGS")
+            depth_3dgs_rescale = cv2.resize(rendered_depth_3dgs, (tile_w, tile_h))
+            depth_obj_rescale = cv2.resize(depth_obj, (tile_w, tile_h))
 
+            cv2.putText(rgb1, "GS RGB", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+            cv2.putText(rgb2, "OBJ RGB", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+            cv2.putText(depth1, "GS Depth", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+            cv2.putText(depth2, "OBJ Depth", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
 
-        # plt.subplot(2, 2, 2)
-        # plt.imshow(depth_vis_3dgs, cmap='inferno')
-        # plt.title("Rendered Depth 3DGS")
+            top = np.hstack([rgb1, rgb2])
+            bottom = np.hstack([depth1, depth2])
+            grid = np.vstack([top, bottom])  # final shape: (1080, 1920, 3)
 
-        # plt.subplot(2, 2, 3)
-        # plt.imshow(rgb_vis_obj)
-        # plt.title("GT RGB")
-
-        # plt.subplot(2, 2, 3)
-        # plt.imshow(gt_img_rgb)
-        # plt.title("OBJ RGB")
-
-        # plt.subplot(2, 2, 4)
-        # plt.imshow(depth_vis_obj, cmap='inferno')
-        # plt.title("Rendered Depth OBJ")
-
-        # plt.show()
+            cv2.namedWindow("Renderings", cv2.WINDOW_NORMAL)
+            cv2.imshow("Renderings", grid)
+            cv2.resizeWindow("Renderings", display_w, display_h)
+            cv2.setMouseCallback("Renderings", quadrant_callback, param=(rgb1, rgb2, depth1, depth2, depth_3dgs_rescale, depth_obj_rescale))
 
 
-    video_writer.release()
-    print(f"✅ Video saved at: {video_path}")
+            # # Add windows and mouse callback
+            # cv2.namedWindow("GS RGB")
+            # cv2.setMouseCallback("GS RGB", on_mouse_click, param=("GS RGB", rgb_vis_3dgs, rendered_depth_3dgs))
+            # cv2.imshow("GS RGB", rgb_vis_3dgs)
+
+            # cv2.namedWindow("GS Depth")
+            # cv2.setMouseCallback("GS Depth", on_mouse_click, param=("GS Depth", depth_vis_3dgs, rendered_depth_3dgs))
+            # cv2.imshow("GS Depth", depth_vis_3dgs)
+
+            # cv2.namedWindow("OBJ RGB")
+            # cv2.setMouseCallback("OBJ RGB", on_mouse_click, param=("OBJ RGB", rgb_vis_3dgs, depth_obj))
+            # cv2.imshow("OBJ RGB", rgb_vis_3dgs)
+
+            # cv2.namedWindow("OBJ Depth")
+            # cv2.setMouseCallback("OBJ Depth", on_mouse_click, param=("OBJ Depth", depth_vis_obj, depth_obj))
+            # cv2.imshow("OBJ Depth", depth_vis_obj)
+
+            print("🔍 Click on any window to annotate pixel values. Press any key to move to the next frame.")
+            key = cv2.waitKey(0)
+            if key in [27, ord('q')]:  # ESC or 'q'
+                print("🛑 Exiting...")
+                break
+
+    if args.render_video:
+
+        video_writer.release()
+        print(f"✅ Video saved at: {video_path}")
+    else:
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
