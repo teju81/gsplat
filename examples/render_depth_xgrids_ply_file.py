@@ -260,9 +260,9 @@ def quadrant_callback(event, x, y, flags, param):
     if y < h and x < w:
         on_mouse_click(event, x, y, flags, ("Renderings", rgb1, depth_3dgs_rescale))
     elif y < h and x >= w:
-        on_mouse_click(event, x - w, y, flags, ("Renderings", rgb2, depth_3dgs_rescale))
+        on_mouse_click(event, x - w, y, flags, ("Renderings", rgb2, depth_obj_rescale))
     elif y >= h and x < w:
-        on_mouse_click(event, x, y - h, flags, ("Renderings", depth1, depth_obj_rescale))
+        on_mouse_click(event, x, y - h, flags, ("Renderings", depth1, depth_3dgs_rescale))
     elif y >= h and x >= w:
         on_mouse_click(event, x - w, y - h, flags, ("Renderings", depth2, depth_obj_rescale))
     # re-render grid with updated images
