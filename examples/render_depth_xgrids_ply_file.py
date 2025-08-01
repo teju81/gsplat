@@ -274,7 +274,7 @@ def main():
     parser = argparse.ArgumentParser(description="Load trained Gaussian Splat stored as a ply file and render RGBD images.")
     parser.add_argument("--ply_path", type=str, default="/root/code/datasets/artgarage/xgrids/4/02_Output/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply", 
             help="Path to ply file")
-    parser.add_argument("--render_video", type=bool, default=False, help="Render Video or Images")
+    parser.add_argument("--render_video", type=bool, default=1, help="Render Video or Images")
     args = parser.parse_args()
 
 
@@ -332,8 +332,8 @@ def main():
         tile_w, tile_h = display_w // 2, display_h // 2
 
     for idx, row in df.iterrows():
-        if idx > 30:
-            break
+        # if idx > 30:
+        #     break
         # imgname = row["imgname"][:-4]
         # img_path = f"/root/code/datasets/artgarage/xgrids/3/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/perspective/images/{imgname}_2.jpg"
         # gt_img = cv2.imread(img_path)
