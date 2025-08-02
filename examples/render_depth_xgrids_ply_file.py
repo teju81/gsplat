@@ -16,6 +16,13 @@ from torchvision.transforms import ToTensor
 from scipy.spatial.transform import Rotation as R
 import open3d as o3d
 
+import pygame
+from pygame.locals import *
+import math
+import glm # We'll use PyGLM for easier matrix math
+import sys
+
+
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
 
@@ -46,24 +53,201 @@ def build_scaling_rotation(s, r):
     return L
 
 
+def on_mouse_click(event, x, y, flags, param):
+    if event == cv2.EVENT_LBUTTONDOWN:
+        window, img, depth = param  # Unpack color/depth flag
+        val = depth[y, x]
+        text = f"({x}, {y}): {val:.3f}"
+        cv2.putText(img, text, (x+10, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+        cv2.imshow(window, img)
+
+def quadrant_callback(event, x, y, flags, param):
+    rgb1, rgb2, depth1, depth2, depth_3dgs_rescale, depth_obj_rescale = param
+    h, w, _ = rgb1.shape
+    if y < h and x < w:
+        on_mouse_click(event, x, y, flags, ("Renderings", rgb1, depth_3dgs_rescale))
+    elif y < h and x >= w:
+        on_mouse_click(event, x - w, y, flags, ("Renderings", rgb2, depth_obj_rescale))
+    elif y >= h and x < w:
+        on_mouse_click(event, x, y - h, flags, ("Renderings", depth1, depth_3dgs_rescale))
+    elif y >= h and x >= w:
+        on_mouse_click(event, x - w, y - h, flags, ("Renderings", depth2, depth_obj_rescale))
+    # re-render grid with updated images
+    grid = np.vstack([np.hstack([rgb1, rgb2]), np.hstack([depth1, depth2])])
+    cv2.imshow("Renderings", grid)
+
+def normalize_depth(depth: np.ndarray, depth_min=0.0, depth_max=30.0) -> np.ndarray:
+    norm = (depth - depth_min) / (depth_max - depth_min + 1e-8)
+    depth_vis = (norm * 255).astype(np.uint8)
+    #return cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
+    return cv2.cvtColor(depth_vis, cv2.COLOR_GRAY2BGR)  # convert to 3-channel BGR for OpenCV annotation
+
+
+
+class Camera:
+    def __init__(self, H=1080, W=1920, fx=1080, fy=1080):
+        self.H = H
+        self.W = W
+        self.fx = fx
+        self.fy = fy
+        self.cx = self.W/2
+        self.cy = self.H/2
+        self.Ks = torch.tensor([[self.fx, 0.0, self.cx],
+               [0.0, self.fy, self.cy],
+               [0.0,  0.0,  1.0]], dtype=torch.float32).to("cuda")
+        self.Ks = self.Ks.unsqueeze(0)  # shape: [1, 3, 3]
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+        self.roll = 0.0
+        self.pitch = 0.0
+        self.yaw = 0.0
+
+        self.T = torch.eye(4, dtype=torch.float32).unsqueeze(0).to("cuda")
+
+    def move_camera_quat(self, tx, ty, tz, qx, qy, qz, qw):
+        # Convert quaternion to rotation matrix
+        r = R.from_quat([qx, qy, qz, qw])
+        R_mat = torch.tensor(r.as_matrix(), dtype=torch.float32)
+        t_vec = torch.tensor([tx, ty, tz], dtype=torch.float32)
+
+        T = torch.eye(4, dtype=torch.float32)
+        T[:3, :3] = R_mat
+        T[:3, 3] = (R_mat @ t_vec)
+        self.T = T.unsqueeze(0).to("cuda")  # shape: [1, 4, 4]
+        
+        return
+
+    # def set_camera_viewpoint(self, tx, ty, tz, pos, yaw, pitch):
+    #     # Look direction vector
+    #     front = np.array([
+    #         np.cos(pitch) * np.sin(yaw),
+    #         np.sin(pitch),
+    #         np.cos(pitch) * np.cos(yaw)
+    #     ])
+    #     front = front / np.linalg.norm(front)
+
+    #     up = np.array([0.0, 1.0, 0.0])
+    #     right = np.cross(up, front)
+    #     up = np.cross(front, right)
+
+    #     R = torch.eye(4, dtype=torch.float32)
+
+    #     R[:3, 0] = torch.from_numpy(right).to(dtype=torch.float32)
+    #     R[:3, 1] = torch.from_numpy(up).to(dtype=torch.float32)
+    #     R[:3, 2] = torch.from_numpy(-front).to(dtype=torch.float32)
+
+    #     T = torch.eye(4, dtype=torch.float32)
+    #     T[:3, 3] = torch.from_numpy(-pos).to(dtype=torch.float32)
+    #     cam_pose = R @ T
+    #     self.T = cam_pose.unsqueeze(0).to("cuda")  # camera-to-world inverse
+    #     return
+
+    def set_camera_viewpoint(self, x=0, y=0, z=0, roll=0, pitch=0, yaw=0):
+
+        # set camera pose
+
+        self.x = x
+        self.y = y
+        self.z = z
+        self.roll = roll
+        self.pitch = pitch
+        self.yaw = yaw
+        rot = R.from_euler('zyx', [roll, pitch, yaw], degrees=True)
+        R_mat = rot.as_matrix()          # 3x3
+
+
+        camera_pos = np.array([x, y, z])
+        t = np.array(camera_pos, dtype=np.float32).reshape(3, 1)
+
+        np_view = np.eye(4, dtype=np.float32)
+        np_view[0:3, 0:3] = R_mat         # inverse rotation
+
+        np_view[0:3, 3] = np.squeeze(R_mat @ t)     # inverse translation
+
+
+        self.T = torch.from_numpy(np_view).to(dtype=torch.float32).unsqueeze(0).to("cuda")
+
+        return
+
+
+    def rotate_camera(self, roll=0, pitch=0, yaw=0):
+        # Get current rotation matrix from T
+        R_curr = self.T[0, 0:3, 0:3].cpu().numpy()  # [3, 3]
+
+        # Compute incremental rotation (local frame)
+        R_delta = R.from_euler('zyx', [yaw, pitch, roll], degrees=True).as_matrix()
+
+        # Apply local-frame rotation: R_new = R_curr @ R_delta
+        R_new = R_curr @ R_delta
+
+        # Update the transformation matrix
+        np_view = np.eye(4, dtype=np.float32)
+        np_view[0:3, 0:3] = R_new
+        camera_pos = torch.tensor([self.x, self.y, self.z], dtype=torch.float32)
+        camera_pos = np.squeeze(np.array(camera_pos.cpu(), dtype=np.float32).reshape(3, 1))
+        np_view[0:3, 3] = camera_pos
+
+        self.T = torch.from_numpy(np_view).to(dtype=torch.float32).unsqueeze(0).to("cuda")
+
+
+    def move_camera(self, move_vec):
+
+        self.x += move_vec[0]
+        self.y += move_vec[1]
+        self.z += move_vec[2]
+
+        # Update camera pose
+        self.T[0,0,3] = self.x
+        self.T[0,1,3] = self.y
+        self.T[0,2,3] = self.z
+
+        return
+
+
+    def pygame_move_camera(self):
+        keys = pygame.key.get_pressed()
+        
+        move_vec=torch.from_numpy(np.zeros(3)).to(dtype=torch.float32).to("cuda")
+        R_mat = self.T.squeeze(0)[0:3, 0:3]
+        front = -R_mat[:, 2]
+        right = R_mat[:, 0]
+        up = R_mat[:, 1]
+
+        roll, pitch, yaw = 0, 0, 0
+        
+        if keys[K_w]:
+            move_vec -= 0.1 * front
+            self.move_camera(move_vec)
+        if keys[K_s]:
+            move_vec += 0.1 * front
+            self.move_camera(move_vec)
+        if keys[K_d]:
+            move_vec += 0.1 * right
+            self.move_camera(move_vec)
+        if keys[K_a]:
+            move_vec -= 0.1 * right
+            self.move_camera(move_vec)
+
+        if keys[K_i]:
+            roll += 1.0
+            self.rotate_camera(roll, pitch, yaw)
+        if keys[K_k]:
+            roll -= 1.0
+            self.rotate_camera(roll, pitch, yaw)
+        if keys[K_j]:
+            pitch -= 1.0
+            self.rotate_camera(roll, pitch, yaw)
+        if keys[K_l]:
+            pitch += 1.0
+            self.rotate_camera(roll, pitch, yaw)
+
+
+        return
+
 class GaussianModel:
-    def setup_functions(self):
-        def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
-            L = build_scaling_rotation(scaling_modifier * scaling, rotation)
-            actual_covariance = L @ L.transpose(1, 2)
-            symm = strip_symmetric(actual_covariance)
-            return symm
-        self.scaling_activation = torch.exp
-        self.scaling_inverse_activation = torch.log
 
-        self.covariance_activation = build_covariance_from_scaling_rotation
-
-        self.opacity_activation = torch.sigmoid
-        self.inverse_opacity_activation = inverse_sigmoid
-
-        self.rotation_activation = torch.nn.functional.normalize
-
-    def __init__(self, sh_degree, optimizer_type="default"):
+    def __init__(self, sh_degree, ply_path=None, optimizer_type="default"):
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree  
@@ -80,6 +264,26 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+
+        # Load ply file
+        if ply_path is not None:
+            self.load_ply(ply_path)
+
+    def setup_functions(self):
+        def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
+            L = build_scaling_rotation(scaling_modifier * scaling, rotation)
+            actual_covariance = L @ L.transpose(1, 2)
+            symm = strip_symmetric(actual_covariance)
+            return symm
+        self.scaling_activation = torch.exp
+        self.scaling_inverse_activation = torch.log
+
+        self.covariance_activation = build_covariance_from_scaling_rotation
+
+        self.opacity_activation = torch.sigmoid
+        self.inverse_opacity_activation = inverse_sigmoid
+
+        self.rotation_activation = torch.nn.functional.normalize
 
     def load_ply(self, path, use_train_test_exp = False):
         plydata = PlyData.read(path)
@@ -190,27 +394,14 @@ class GaussianModel:
         return render_colors, render_alphas, info
 
 
-# def normalize_depth(depth, max_depth=5.0):
-#     """Normalize depth for visualization"""
-#     depth = np.clip(depth, 0, max_depth)
-#     depth_vis = (depth / max_depth * 255).astype(np.uint8)
-#     return cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
-
-def normalize_depth(depth: np.ndarray, depth_min=0.0, depth_max=30.0) -> np.ndarray:
-    norm = (depth - depth_min) / (depth_max - depth_min + 1e-8)
-    depth_vis = (norm * 255).astype(np.uint8)
-    #return cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
-    return cv2.cvtColor(depth_vis, cv2.COLOR_GRAY2BGR)  # convert to 3-channel BGR for OpenCV annotation
-
-
-def render_rgbd_from_obj(obj_path, cam_intrinsics, cam_pose, width, height):
+def render_rgbd_from_obj(cam, obj_path):
     mesh = o3d.io.read_triangle_mesh(obj_path)
     if mesh.is_empty():
         raise ValueError(f"Failed to load mesh from {obj_path}")
 
     mesh.compute_vertex_normals()
 
-    renderer = o3d.visualization.rendering.OffscreenRenderer(width, height)
+    renderer = o3d.visualization.rendering.OffscreenRenderer(cam.W, cam.H)
     renderer.scene.set_background([0, 0, 0, 1])
 
     material = o3d.visualization.rendering.MaterialRecord()
@@ -218,12 +409,13 @@ def render_rgbd_from_obj(obj_path, cam_intrinsics, cam_pose, width, height):
     renderer.scene.add_geometry("mesh", mesh, material)
 
     intrinsic = o3d.camera.PinholeCameraIntrinsic()
-    intrinsic.set_intrinsics(width, height, *cam_intrinsics)
+    cam_intrinsics = [cam.fx, cam.fy, cam.cx, cam.cy]
+    intrinsic.set_intrinsics(cam.W, cam.H, *cam_intrinsics)
 
     # extrinsic = np.linalg.inv(cam_pose.cpu().numpy()).astype(np.float32)
     # renderer.setup_camera(intrinsic, extrinsic)
     
-    extrinsic = np.linalg.inv(cam_pose.squeeze(0).cpu().numpy()).astype(np.float64)
+    extrinsic = np.linalg.inv(cam.T.squeeze(0).cpu().numpy()).astype(np.float64)
     renderer.setup_camera(intrinsic, extrinsic)
 
     color = renderer.render_to_image()
@@ -234,76 +426,39 @@ def render_rgbd_from_obj(obj_path, cam_intrinsics, cam_pose, width, height):
 
     return color_np, depth_np
 
-def pose_to_camtoworld(tx, ty, tz, qx, qy, qz, qw):
-    # Convert quaternion to rotation matrix
-    r = R.from_quat([qx, qy, qz, qw])
-    R_mat = torch.tensor(r.as_matrix(), dtype=torch.float32)
-    t_vec = torch.tensor([tx, ty, tz], dtype=torch.float32)
 
-    T = torch.eye(4, dtype=torch.float32)
-    T[:3, :3] = R_mat
-    T[:3, 3] = (R_mat @ t_vec)
-    return T.unsqueeze(0).to("cuda")  # shape: [1, 4, 4]
-
-
-def on_mouse_click(event, x, y, flags, param):
-    if event == cv2.EVENT_LBUTTONDOWN:
-        window, img, depth = param  # Unpack color/depth flag
-        val = depth[y, x]
-        text = f"({x}, {y}): {val:.3f}"
-        cv2.putText(img, text, (x+10, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
-        cv2.imshow(window, img)
-
-def quadrant_callback(event, x, y, flags, param):
-    rgb1, rgb2, depth1, depth2, depth_3dgs_rescale, depth_obj_rescale = param
-    h, w, _ = rgb1.shape
-    if y < h and x < w:
-        on_mouse_click(event, x, y, flags, ("Renderings", rgb1, depth_3dgs_rescale))
-    elif y < h and x >= w:
-        on_mouse_click(event, x - w, y, flags, ("Renderings", rgb2, depth_obj_rescale))
-    elif y >= h and x < w:
-        on_mouse_click(event, x, y - h, flags, ("Renderings", depth1, depth_3dgs_rescale))
-    elif y >= h and x >= w:
-        on_mouse_click(event, x - w, y - h, flags, ("Renderings", depth2, depth_obj_rescale))
-    # re-render grid with updated images
-    grid = np.vstack([np.hstack([rgb1, rgb2]), np.hstack([depth1, depth2])])
-    cv2.imshow("Renderings", grid)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Load trained Gaussian Splat stored as a ply file and render RGBD images.")
-    parser.add_argument("--ply_path", type=str, default="/root/code/datasets/artgarage/xgrids/4/02_Output/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply", 
-            help="Path to ply file")
-    parser.add_argument("--render_video", type=bool, default=1, help="Render Video or Images")
-    args = parser.parse_args()
-
-
-    # # R: 3x3 rotation, t: 3x1 translation
-    # R = torch.eye(3).to("cuda")
-    # t = torch.tensor([0, 0, 0], dtype=torch.float32).to("cuda")
-    # T = torch.eye(4, device="cuda")
-    # T[:3, :3] = R.T  # Transpose of R
-    # T[:3, 3] = (-R.T @ t).flatten()
-    # camtoworlds = T.unsqueeze(0)  # Shape: [1, 4, 4]
-
-    H, W = 1080, 1920
-    fx = fy = 1080
-    cx, cy = W/2, H/2
-    Ks = torch.tensor([[fx, 0.0, cx],
-           [0.0, fy, cy],
-           [0.0,  0.0,  1.0]], dtype=torch.float32).to("cuda")
-    Ks = Ks.unsqueeze(0)  # shape: [1, 3, 3]
-
+def rasterize_rgbd(cam, gaussian_model):
 
     image_ids = torch.tensor([0], dtype=torch.long)  # Shape: [1]
-    masks = torch.ones((1, H, W, 4), dtype=torch.bool)  # Shape: [1, 1080, 1920, 4]
+    masks = torch.ones((1, cam.H, cam.W, 4), dtype=torch.bool)  # Shape: [1, 1080, 1920, 4]
 
-    ply_path="/root/code/datasets/artgarage/xgrids/4/02_Output/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply"
+    # 3DGS Renderings
+    renders, alphas, info = gaussian_model.rasterize_splats(
+        camtoworlds=cam.T,
+        Ks=cam.Ks,
+        width=cam.W,
+        height=cam.H,
+        sh_degree=3,
+        near_plane=0.001,
+        far_plane=100.0,
+        image_ids=image_ids,
+        render_mode="RGB+D",
+        masks=masks,
+    )
+    colors, depths = renders[..., 0:3], renders[..., 3:4]
 
-    gaussian_model = GaussianModel(3)
 
-    # Load configuration
-    gaussian_model.load_ply(ply_path)
+    return colors, depths
+
+
+
+def render_xgrids_pose_file(gaussian_model, render_video=False):
+
+    # Initialize Camera
+    H = 1080
+    W = 1920
+    fx = fy = 1080
+    cam = Camera(H, W, fx, fy)
 
     # Load trajectory
     pose_file =  "img_traj.csv" # "panoramicPoses.csv" "img_traj.csv" "poses.csv"
@@ -316,7 +471,7 @@ def main():
     #              names=["timestamp", "tx", "ty", "tz", "qx", "qy", "qz", "qw"])
 
 
-    if args.render_video:
+    if render_video:
 
         # Define output path
         video_path = "/root/code/datasets/artgarage/xgrids/rendered_comparison.mp4"
@@ -328,36 +483,23 @@ def main():
         fps=0.5
         video_writer = cv2.VideoWriter(video_path, fourcc, fps, output_size)
     else:
-        display_w, display_h = 1920, 1080
+        display_w, display_h = W, H
         tile_w, tile_h = display_w // 2, display_h // 2
 
     for idx, row in df.iterrows():
         # if idx > 30:
         #     break
+
         # imgname = row["imgname"][:-4]
         # img_path = f"/root/code/datasets/artgarage/xgrids/3/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/perspective/images/{imgname}_2.jpg"
         # gt_img = cv2.imread(img_path)
         # gt_img_rgb = cv2.cvtColor(gt_img, cv2.COLOR_BGR2RGB)
         # gt_tensor = ToTensor()(gt_img_rgb).permute(1, 2, 0).unsqueeze(0).to("cuda")  # [1, H, W, 3]
 
-        # Camera pose
-        camtoworlds = pose_to_camtoworld(row.tx, row.ty, row.tz, row.qx, row.qy, row.qz, row.qw)
+        # Set Camera Viewpoint
+        cam.set_camera_viewpoint(row.tx, row.ty, row.tz, row.qx, row.qy, row.qz, row.qw)
 
-
-        # 3DGS Renderings
-        renders, alphas, info = gaussian_model.rasterize_splats(
-            camtoworlds=camtoworlds,
-            Ks=Ks,
-            width=W,
-            height=H,
-            sh_degree=3,
-            near_plane=0.001,
-            far_plane=30.0,
-            image_ids=image_ids,
-            render_mode="RGB+D",
-            masks=masks,
-        )
-        colors, depths = renders[..., 0:3], renders[..., 3:4]
+        colors, depths = rasterize_rgbd(cam, gaussian_model)
 
         # # Convert to CPU and numpy
         rendered_rgb_3dgs = colors[0].clamp(0, 1).detach().cpu().numpy()  # [H, W, 3]
@@ -366,22 +508,24 @@ def main():
         # === Convert to displayable format ===
         rgb_vis_3dgs = (rendered_rgb_3dgs * 255).astype(np.uint8)
         rgb_vis_3dgs = cv2.cvtColor(rgb_vis_3dgs, cv2.COLOR_RGB2BGR)
-        depth_vis_3dgs = normalize_depth(rendered_depth_3dgs, rendered_depth_3dgs.min(), rendered_depth_3dgs.max())
+        depth_min = rendered_depth_3dgs.min()
+        depth_max = rendered_depth_3dgs.max()
+        depth_vis_3dgs = normalize_depth(rendered_depth_3dgs, depth_min, depth_max)
         
 
         # OBJ File Renderings
         obj_file = "/root/code/datasets/artgarage/xgrids/4/02_Output/Gaussian/Mesh_Files/art_garage_sample.obj"
         #obj_file = "/root/code/datasets/artgarage/xgrids/4/02_Output/Mesh_textured/texture/block0.obj"
-        cam_intrinsics = [fx, fy, cx, cy]
-        rgb_obj, depth_obj = render_rgbd_from_obj(obj_file, cam_intrinsics, camtoworlds, W, H)
+
+        rgb_obj, depth_obj = render_rgbd_from_obj(cam, obj_file)
     
         # Ensure OBJ RGB is BGR
         rgb_vis_obj = cv2.cvtColor(rgb_obj, cv2.COLOR_RGB2BGR)
         # Normalize OBJ depth for visualization
-        depth_vis_obj = normalize_depth(depth_obj)
+        depth_vis_obj = normalize_depth(depth_obj, depth_min, depth_max)
 
 
-        if args.render_video:
+        if render_video:
 
             cv2.putText(rgb_vis_3dgs, "GS RGB", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
             cv2.putText(rgb_vis_obj,  "OBJ RGB", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
@@ -446,12 +590,89 @@ def main():
                 print("🛑 Exiting...")
                 break
 
-    if args.render_video:
+    if render_video:
 
         video_writer.release()
         print(f"✅ Video saved at: {video_path}")
     else:
         cv2.destroyAllWindows()
+
+
+def vr_walkthrough(gaussian_model):
+    # Initialize Camera
+    H = 1080
+    W = 1920
+    fx = fy = 1080
+    cam = Camera(H, W, fx, fy)
+
+    # Track position and orientation of the camera over time
+    tx, ty, tz, roll, pitch, yaw = 0, 0, 0, 0, 0, 0
+    cam.set_camera_viewpoint(tx, ty, tz, roll, pitch, yaw)
+
+    pygame.init()
+    display_width, display_height = W, H
+    screen = pygame.display.set_mode((display_width, display_height))
+    pygame.display.set_caption("Gaussian Splat Viewpoint Control")
+
+    pygame.event.set_grab(True)
+    pygame.mouse.set_visible(False)
+
+    clock = pygame.time.Clock()
+    running = True
+
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+            # elif event.type == pygame.MOUSEMOTION:
+            #     handle_mouse_input(event)
+
+        cam.pygame_move_camera()
+
+        # === Call the Gaussian Rasterizer ===
+        colors, depths = rasterize_rgbd(cam, gaussian_model)
+
+        # # Convert to CPU and numpy
+        rendered_rgb_3dgs = colors[0].clamp(0, 1).detach().cpu().numpy()  # [H, W, 3]
+        #rendered_depth_3dgs = depths[0].squeeze(2).detach().cpu().numpy()  # [H, W]
+
+        # === Convert to displayable format ===
+        rgb_vis_3dgs = (rendered_rgb_3dgs * 255).astype(np.uint8)
+
+
+        # === Display the output image ===
+        # Convert the NumPy array to a Pygame surface
+        # The swapaxes() is crucial because NumPy arrays and Pygame surfaces have different memory layouts.
+        # NumPy is (height, width, channels), Pygame is (width, height, channels).
+        image_surface = pygame.surfarray.make_surface(rgb_vis_3dgs.swapaxes(0, 1))
+
+        # Blit the surface to the screen
+        screen.blit(image_surface, (0, 0))
+
+        pygame.display.flip()
+        clock.tick(60)
+
+    pygame.quit()
+    sys.exit()
+
+
+
+
+def main():
+    # parser = argparse.ArgumentParser(description="Load trained Gaussian Splat stored as a ply file and render RGBD images.")
+    # parser.add_argument("--render_video", type=bool, default=False, help="Render Video or Images")
+    # args = parser.parse_args()
+
+    ply_file_path="/root/code/datasets/artgarage/xgrids/4/02_Output/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply"
+    gaussian_model = GaussianModel(3, ply_file_path)
+
+    #render_xgrids_pose_file(gaussian_model, render_video=True)
+
+    vr_walkthrough(gaussian_model)
+
 
 if __name__ == "__main__":
     main()
