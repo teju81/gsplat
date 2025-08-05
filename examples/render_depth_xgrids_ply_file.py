@@ -21,7 +21,7 @@ from pygame.locals import *
 import math
 import glm # We'll use PyGLM for easier matrix math
 import sys
-
+import os
 
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
@@ -82,7 +82,46 @@ def normalize_depth(depth: np.ndarray, depth_min=0.0, depth_max=30.0) -> np.ndar
     #return cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
     return cv2.cvtColor(depth_vis, cv2.COLOR_GRAY2BGR)  # convert to 3-channel BGR for OpenCV annotation
 
+class Recorder:
+    def __init__(self, color_dir="color", depth_dir="depth", json_path="/root/code/output/gaussian_splatting/xgrids_vr/poses.json"):
+        self.color_dir = color_dir
+        self.depth_dir = depth_dir
+        self.json_path = json_path
+        self.data = []
+        self.frame_id = 0
 
+        os.makedirs(self.color_dir, exist_ok=True)
+        os.makedirs(self.depth_dir, exist_ok=True)
+
+    def record(self, rgb: np.ndarray, depth: np.ndarray, pose: np.ndarray):
+        """
+        Args:
+            rgb (H x W x 3): np.uint8
+            depth (H x W): np.float32 or np.uint16
+            pose (4 x 4): np.ndarray, camera-to-world matrix
+        """
+        # File names
+        name = f"frame_{self.frame_id:04d}.png"
+        color_path = os.path.join(self.color_dir, name)
+        depth_path = os.path.join(self.depth_dir, name)
+
+        # Save images
+        cv2.imwrite(color_path, rgb)
+        depth_scaled = depth
+        cv2.imwrite(depth_path, depth_scaled)
+
+        # Append metadata
+        self.data.append({
+            "color_path": color_path,
+            "depth_path": depth_path,
+            "pose": pose.tolist()
+        })
+
+        self.frame_id += 1
+
+    def save_json(self):
+        with open(self.json_path, 'w') as f:
+            json.dump(self.data, f, indent=4)
 
 class Camera:
     def __init__(self, H=1080, W=1920, fx=1080, fy=1080):
@@ -241,6 +280,13 @@ class Camera:
         if keys[K_l]:
             pitch += 1.0
             self.rotate_camera(roll, pitch, yaw)
+        if keys[K_u]:
+            yaw -= 1.0
+            self.rotate_camera(roll, pitch, yaw)
+        if keys[K_o]:
+            yaw += 1.0
+            self.rotate_camera(roll, pitch, yaw)
+
 
 
         return
@@ -463,7 +509,7 @@ def render_xgrids_pose_file(gaussian_model, render_video=False):
     # Load trajectory
     pose_file =  "img_traj.csv" # "panoramicPoses.csv" "img_traj.csv" "poses.csv"
 
-    img_traj_path = f"/root/code/datasets/artgarage/xgrids/3/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/{pose_file}"
+    img_traj_path = f"/root/code/datasets/ARTGarage/xgrids/1/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/{pose_file}"
     df = pd.read_csv(img_traj_path, comment="#", sep='\s+',
                  names=["timestamp", "imgname", "tx", "ty", "tz", "qx", "qy", "qz", "qw"])
 
@@ -474,7 +520,7 @@ def render_xgrids_pose_file(gaussian_model, render_video=False):
     if render_video:
 
         # Define output path
-        video_path = "/root/code/datasets/artgarage/xgrids/rendered_comparison.mp4"
+        video_path = "/root/code/datasets/ARTGarage/xgrids/rendered_comparison.mp4"
 
         # Define video writer (assumes 1920x1080 images → adjust if needed)
         frame_h, frame_w = H, W
@@ -491,7 +537,7 @@ def render_xgrids_pose_file(gaussian_model, render_video=False):
         #     break
 
         # imgname = row["imgname"][:-4]
-        # img_path = f"/root/code/datasets/artgarage/xgrids/3/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/perspective/images/{imgname}_2.jpg"
+        # img_path = f"/root/code/datasets/ARTGarage/xgrids/1/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/perspective/images/{imgname}_2.jpg"
         # gt_img = cv2.imread(img_path)
         # gt_img_rgb = cv2.cvtColor(gt_img, cv2.COLOR_BGR2RGB)
         # gt_tensor = ToTensor()(gt_img_rgb).permute(1, 2, 0).unsqueeze(0).to("cuda")  # [1, H, W, 3]
@@ -514,8 +560,8 @@ def render_xgrids_pose_file(gaussian_model, render_video=False):
         
 
         # OBJ File Renderings
-        obj_file = "/root/code/datasets/artgarage/xgrids/4/02_Output/Gaussian/Mesh_Files/art_garage_sample.obj"
-        #obj_file = "/root/code/datasets/artgarage/xgrids/4/02_Output/Mesh_textured/texture/block0.obj"
+        obj_file = "/root/code/datasets/ARTGarage/xgrids/4/Gaussian/Mesh_Files/art_garage_sample.obj"
+        #obj_file = "/root/code/datasets/ARTGarage/xgrids/4/Mesh_textured/texture/block0.obj"
 
         rgb_obj, depth_obj = render_rgbd_from_obj(cam, obj_file)
     
@@ -599,6 +645,7 @@ def render_xgrids_pose_file(gaussian_model, render_video=False):
 
 
 def vr_walkthrough(gaussian_model):
+
     # Initialize Camera
     H = 1080
     W = 1920
@@ -608,6 +655,14 @@ def vr_walkthrough(gaussian_model):
     # Track position and orientation of the camera over time
     tx, ty, tz, roll, pitch, yaw = 0, 0, 0, 0, 0, 0
     cam.set_camera_viewpoint(tx, ty, tz, roll, pitch, yaw)
+
+    rgb_folder_path = "/root/code/output/gaussian_splatting/xgrids_vr/color"
+    depth_folder_path = "/root/code/output/gaussian_splatting/xgrids_vr/depth"
+
+
+    # os.makedirs(rgb_folder_path, exist_ok=True)
+    # os.makedirs(depth_folder_path, exist_ok=True)
+
 
     pygame.init()
     display_width, display_height = W, H
@@ -619,6 +674,7 @@ def vr_walkthrough(gaussian_model):
 
     clock = pygame.time.Clock()
     running = True
+    recorder = Recorder(rgb_folder_path, depth_folder_path)
 
     while running:
         for event in pygame.event.get():
@@ -637,12 +693,18 @@ def vr_walkthrough(gaussian_model):
 
         # # Convert to CPU and numpy
         rendered_rgb_3dgs = colors[0].clamp(0, 1).detach().cpu().numpy()  # [H, W, 3]
-        #rendered_depth_3dgs = depths[0].squeeze(2).detach().cpu().numpy()  # [H, W]
+        rendered_depth_3dgs = depths[0].squeeze(2).detach().cpu().numpy()  # [H, W]
 
         # === Convert to displayable format ===
         rgb_vis_3dgs = (rendered_rgb_3dgs * 255).astype(np.uint8)
+        depth_min = rendered_depth_3dgs.min()
+        depth_max = rendered_depth_3dgs.max()
+        depth_vis_3dgs = normalize_depth(rendered_depth_3dgs, depth_min, depth_max)
 
 
+        pose = cam.T.squeeze(0).detach().cpu().numpy().astype(np.float32)
+
+        recorder.record(rgb_vis_3dgs, depth_vis_3dgs, pose)
         # === Display the output image ===
         # Convert the NumPy array to a Pygame surface
         # The swapaxes() is crucial because NumPy arrays and Pygame surfaces have different memory layouts.
@@ -655,6 +717,7 @@ def vr_walkthrough(gaussian_model):
         pygame.display.flip()
         clock.tick(60)
 
+    recorder.save_json()
     pygame.quit()
     sys.exit()
 
@@ -666,7 +729,7 @@ def main():
     # parser.add_argument("--render_video", type=bool, default=False, help="Render Video or Images")
     # args = parser.parse_args()
 
-    ply_file_path="/root/code/datasets/artgarage/xgrids/4/02_Output/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply"
+    ply_file_path="/root/code/datasets/ARTGarage/xgrids/4/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply"
     gaussian_model = GaussianModel(3, ply_file_path)
 
     #render_xgrids_pose_file(gaussian_model, render_video=True)
