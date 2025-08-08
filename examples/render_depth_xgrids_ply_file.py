@@ -79,6 +79,7 @@ def quadrant_callback(event, x, y, flags, param):
 def normalize_depth(depth: np.ndarray, depth_min=0.0, depth_max=30.0) -> np.ndarray:
     norm = (depth - depth_min) / (depth_max - depth_min + 1e-8)
     depth_vis = (norm * 255).astype(np.uint8)
+
     #return cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
     return cv2.cvtColor(depth_vis, cv2.COLOR_GRAY2BGR)  # convert to 3-channel BGR for OpenCV annotation
 
@@ -287,8 +288,6 @@ class Camera:
             yaw += 1.0
             self.rotate_camera(roll, pitch, yaw)
 
-
-
         return
 
 class GaussianModel:
@@ -473,7 +472,7 @@ def render_rgbd_from_obj(cam, obj_path):
     return color_np, depth_np
 
 
-def rasterize_rgbd(cam, gaussian_model):
+def rasterize_rgbd(cam, gaussian_model, near_plane=0.001, far_plane=100.0):
 
     image_ids = torch.tensor([0], dtype=torch.long)  # Shape: [1]
     masks = torch.ones((1, cam.H, cam.W, 4), dtype=torch.bool)  # Shape: [1, 1080, 1920, 4]
@@ -485,8 +484,8 @@ def rasterize_rgbd(cam, gaussian_model):
         width=cam.W,
         height=cam.H,
         sh_degree=3,
-        near_plane=0.001,
-        far_plane=100.0,
+        near_plane=near_plane,
+        far_plane=far_plane,
         image_ids=image_ids,
         render_mode="RGB+D",
         masks=masks,
@@ -644,20 +643,156 @@ def render_xgrids_pose_file(gaussian_model, render_video=False):
         cv2.destroyAllWindows()
 
 
-def vr_walkthrough(gaussian_model):
+def vr_walkthrough_opencv(gaussian_model):
+
+    def on_mouse_click1(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            window, img, depth = param  # Unpack color/depth flag
+            val = depth[y, x]
+            text = f"({x}, {y}): {val:.3f}"
+            cv2.putText(img, text, (x+10, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+            cv2.imshow(window, img)
+
+    def quadrant_callback1(event, x, y, flags, param):
+        rgb, depth, rendered_depth_3dgs = param
+        h, w, _ = rgb.shape
+        if y < h:
+            on_mouse_click1(event, x, y, flags, ("Renderings", rgb, rendered_depth_3dgs))
+        elif y >= h:
+            on_mouse_click1(event, x, y - h, flags, ("Renderings", depth, rendered_depth_3dgs))
+
+        # re-render grid with updated images
+        grid = np.vstack([rgb, depth])
+        cv2.imshow("Renderings", grid)
+
 
     # Initialize Camera
     H = 1080
     W = 1920
     fx = fy = 1080
     cam = Camera(H, W, fx, fy)
+    near_plane, far_plane = 0.001, 30.0
+    display_w, display_h = W, H
+    tile_w, tile_h = display_w, display_h // 2
 
     # Track position and orientation of the camera over time
     tx, ty, tz, roll, pitch, yaw = 0, 0, 0, 0, 0, 0
     cam.set_camera_viewpoint(tx, ty, tz, roll, pitch, yaw)
 
-    rgb_folder_path = "/root/code/output/gaussian_splatting/xgrids_vr/color"
-    depth_folder_path = "/root/code/output/gaussian_splatting/xgrids_vr/depth"
+    rgb_folder_path = "/root/code/output/gaussian_splatting/xgrids_vr1/color"
+    depth_folder_path = "/root/code/output/gaussian_splatting/xgrids_vr1/depth"
+    json_path="/root/code/output/gaussian_splatting/xgrids_vr1/poses.json"
+
+
+    # --- Main loop ---
+    cv2.namedWindow("View", cv2.WINDOW_NORMAL)
+    print("Click on any window to annotate pixel values. Use keyboard to move around in the environment.")
+    while True:
+        # === Call the Gaussian Rasterizer ===
+        colors, depths = rasterize_rgbd(cam, gaussian_model, near_plane, far_plane)
+
+        # # Convert to CPU and numpy
+        rendered_rgb_3dgs = colors[0].clamp(0, 1).detach().cpu().numpy()  # [H, W, 3]
+        rendered_depth_3dgs = depths[0].squeeze(2).detach().cpu().numpy()  # [H, W]
+
+        # === Convert to displayable format ===
+        rgb_vis_3dgs = (rendered_rgb_3dgs * 255).astype(np.uint8)
+        rgb_vis_3dgs = cv2.cvtColor(rgb_vis_3dgs, cv2.COLOR_RGB2BGR)
+
+        depth_min = near_plane #rendered_depth_3dgs.min()
+        depth_max = far_plane #rendered_depth_3dgs.max()
+        depth_vis_3dgs = normalize_depth(rendered_depth_3dgs, depth_min, depth_max)
+
+        rgb = cv2.resize(rgb_vis_3dgs, (tile_w, tile_h))
+        depth = cv2.resize(depth_vis_3dgs, (tile_w, tile_h))
+
+        cv2.putText(rgb, "GS RGB", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+        cv2.putText(depth, "GS Depth", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+
+        grid = np.vstack([rgb, depth])
+
+        cv2.namedWindow("Renderings", cv2.WINDOW_NORMAL)
+        cv2.imshow("Renderings", grid)
+        cv2.resizeWindow("Renderings", display_w, display_h)
+        cv2.setMouseCallback("Renderings", quadrant_callback1, param=(rgb, depth, rendered_depth_3dgs))
+
+        pose = cam.T.squeeze(0).detach().cpu().numpy().astype(np.float32)
+
+        #recorder.record(rgb_vis_3dgs, depth_vis_3dgs, pose)
+        #cv2.imshow("View", rgb_vis_3dgs)
+
+        
+        key = cv2.waitKey(0)
+        if key == 27 or key == ord('q'):  # ESC or q to quit
+            break
+
+        move_vec=torch.from_numpy(np.zeros(3)).to(dtype=torch.float32).to("cuda")
+        R_mat = cam.T.squeeze(0)[0:3, 0:3]
+        front = -R_mat[:, 2]
+        right = R_mat[:, 0]
+        up = R_mat[:, 1]
+
+        if key == ord('w'):
+            move_vec -= 0.1 * front
+            cam.move_camera(move_vec)
+
+        if key == ord('s'):
+            move_vec += 0.1 * front
+            cam.move_camera(move_vec)
+
+        if key == ord('a'):
+            move_vec -= 0.1 * right
+            cam.move_camera(move_vec)
+
+        if key == ord('d'):
+            move_vec += 0.1 * right
+            cam.move_camera(move_vec)
+
+
+        roll, pitch, yaw = 0, 0, 0
+        # Rotate
+        if key == ord('i'):
+            roll += 1.0
+            cam.rotate_camera(roll, pitch, yaw)
+
+        if key == ord('k'):
+            roll -= 1.0
+            cam.rotate_camera(roll, pitch, yaw)            
+
+        if key == ord('j'):
+            pitch -= 1.0
+            cam.rotate_camera(roll, pitch, yaw)
+
+        if key == ord('l'):
+            pitch += 1.0
+            cam.rotate_camera(roll, pitch, yaw)            
+
+        if key == ord('u'):
+            yaw -= 1.0
+            cam.rotate_camera(roll, pitch, yaw)
+
+        if key == ord('o'):
+            yaw += 1.0
+            cam.rotate_camera(roll, pitch, yaw)
+
+    cv2.destroyAllWindows()
+
+def vr_walkthrough_pygame(gaussian_model):
+
+    # Initialize Camera
+    H = 1080
+    W = 1920
+    fx = fy = 1080
+    cam = Camera(H, W, fx, fy)
+    near_plane, far_plane = 0.001, 30.0
+
+    # Track position and orientation of the camera over time
+    tx, ty, tz, roll, pitch, yaw = 0, 0, 0, 0, 0, 0
+    cam.set_camera_viewpoint(tx, ty, tz, roll, pitch, yaw)
+
+    rgb_folder_path = "/root/code/output/gaussian_splatting/xgrids_vr1/color"
+    depth_folder_path = "/root/code/output/gaussian_splatting/xgrids_vr1/depth"
+    json_path="/root/code/output/gaussian_splatting/xgrids_vr1/poses.json"
 
 
     # os.makedirs(rgb_folder_path, exist_ok=True)
@@ -674,8 +809,7 @@ def vr_walkthrough(gaussian_model):
 
     clock = pygame.time.Clock()
     running = True
-    recorder = Recorder(rgb_folder_path, depth_folder_path)
-
+    recorder = Recorder(rgb_folder_path, depth_folder_path, json_path)
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -689,7 +823,7 @@ def vr_walkthrough(gaussian_model):
         cam.pygame_move_camera()
 
         # === Call the Gaussian Rasterizer ===
-        colors, depths = rasterize_rgbd(cam, gaussian_model)
+        colors, depths = rasterize_rgbd(cam, gaussian_model, near_plane, far_plane)
 
         # # Convert to CPU and numpy
         rendered_rgb_3dgs = colors[0].clamp(0, 1).detach().cpu().numpy()  # [H, W, 3]
@@ -722,8 +856,6 @@ def vr_walkthrough(gaussian_model):
     sys.exit()
 
 
-
-
 def main():
     # parser = argparse.ArgumentParser(description="Load trained Gaussian Splat stored as a ply file and render RGBD images.")
     # parser.add_argument("--render_video", type=bool, default=False, help="Render Video or Images")
@@ -732,9 +864,10 @@ def main():
     ply_file_path="/root/code/datasets/ARTGarage/xgrids/4/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply"
     gaussian_model = GaussianModel(3, ply_file_path)
 
-    #render_xgrids_pose_file(gaussian_model, render_video=True)
+    # render_xgrids_pose_file(gaussian_model, render_video=True)
 
-    vr_walkthrough(gaussian_model)
+    # vr_walkthrough_opencv(gaussian_model)
+    vr_walkthrough_pygame(gaussian_model)
 
 
 if __name__ == "__main__":
