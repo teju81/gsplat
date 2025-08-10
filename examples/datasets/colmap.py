@@ -7,7 +7,7 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 from PIL import Image
-from pycolmap import SceneManager
+from pycolmap_parser.pycolmap_parser.scene_manager import SceneManager
 from tqdm import tqdm
 from typing_extensions import assert_never
 
