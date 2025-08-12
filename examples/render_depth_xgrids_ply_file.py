@@ -84,17 +84,18 @@ def normalize_depth(depth: np.ndarray, depth_min=0.0, depth_max=30.0) -> np.ndar
     return cv2.cvtColor(depth_vis, cv2.COLOR_GRAY2BGR)  # convert to 3-channel BGR for OpenCV annotation
 
 class Recorder:
-    def __init__(self, color_dir="color", depth_dir="depth", json_path="/root/code/output/gaussian_splatting/xgrids_vr/poses.json"):
+    def __init__(self, color_dir="color", depth_dir="depth", norm_depth_dir="norm_depth", json_path="/root/code/output/gaussian_splatting/xgrids_vr/poses.json"):
         self.color_dir = color_dir
         self.depth_dir = depth_dir
         self.json_path = json_path
-        self.data = []
+        self.data = {}
         self.frame_id = 0
 
         os.makedirs(self.color_dir, exist_ok=True)
         os.makedirs(self.depth_dir, exist_ok=True)
+        os.makedirs(self.norm_depth_dir, exist_ok=True)
 
-    def record(self, rgb: np.ndarray, depth: np.ndarray, pose: np.ndarray):
+    def record(self, rgb: np.ndarray, depth: np.ndarray, norm_depth: np.ndarray, pose: np.ndarray):
         """
         Args:
             rgb (H x W x 3): np.uint8
@@ -105,18 +106,15 @@ class Recorder:
         name = f"frame_{self.frame_id:04d}.png"
         color_path = os.path.join(self.color_dir, name)
         depth_path = os.path.join(self.depth_dir, name)
+        norm_depth_path = os.path.join(self.norm_depth_dir, name)
 
         # Save images
         cv2.imwrite(color_path, rgb)
-        depth_scaled = depth
-        cv2.imwrite(depth_path, depth_scaled)
+        cv2.imwrite(depth_path, depth)
+        cv2.imwrite(norm_depth_path, norm_depth)
 
         # Append metadata
-        self.data.append({
-            "color_path": color_path,
-            "depth_path": depth_path,
-            "pose": pose.tolist()
-        })
+        self.data[self.frame_id]= pose.tolist()
 
         self.frame_id += 1
 
@@ -784,7 +782,7 @@ def vr_walkthrough_pygame(gaussian_model):
     W = 1920
     fx = fy = 1080
     cam = Camera(H, W, fx, fy)
-    near_plane, far_plane = 0.001, 30.0
+    near_plane, far_plane = 0.001, 100.0
 
     # Track position and orientation of the camera over time
     tx, ty, tz, roll, pitch, yaw = 0, 0, 0, 0, 0, 0
@@ -792,6 +790,7 @@ def vr_walkthrough_pygame(gaussian_model):
 
     rgb_folder_path = "/root/code/output/gaussian_splatting/xgrids_vr1/color"
     depth_folder_path = "/root/code/output/gaussian_splatting/xgrids_vr1/depth"
+    norm_depth_folder_path = "/root/code/output/gaussian_splatting/xgrids_vr1/norm_depth"
     json_path="/root/code/output/gaussian_splatting/xgrids_vr1/poses.json"
 
 
@@ -838,7 +837,7 @@ def vr_walkthrough_pygame(gaussian_model):
 
         pose = cam.T.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
-        recorder.record(rgb_vis_3dgs, depth_vis_3dgs, pose)
+        recorder.record(rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs, pose)
         # === Display the output image ===
         # Convert the NumPy array to a Pygame surface
         # The swapaxes() is crucial because NumPy arrays and Pygame surfaces have different memory layouts.
