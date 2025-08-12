@@ -87,6 +87,7 @@ class Recorder:
     def __init__(self, color_dir="color", depth_dir="depth", norm_depth_dir="norm_depth", json_path="/root/code/output/gaussian_splatting/xgrids_vr/poses.json"):
         self.color_dir = color_dir
         self.depth_dir = depth_dir
+        self.norm_depth_dir = norm_depth_dir
         self.json_path = json_path
         self.data = {}
         self.frame_id = 0
@@ -794,10 +795,6 @@ def vr_walkthrough_pygame(gaussian_model):
     json_path="/root/code/output/gaussian_splatting/xgrids_vr1/poses.json"
 
 
-    # os.makedirs(rgb_folder_path, exist_ok=True)
-    # os.makedirs(depth_folder_path, exist_ok=True)
-
-
     pygame.init()
     display_width, display_height = W, H
     screen = pygame.display.set_mode((display_width, display_height))
@@ -808,7 +805,7 @@ def vr_walkthrough_pygame(gaussian_model):
 
     clock = pygame.time.Clock()
     running = True
-    recorder = Recorder(rgb_folder_path, depth_folder_path, json_path)
+    recorder = Recorder(rgb_folder_path, depth_folder_path, norm_depth_folder_path, json_path)
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
