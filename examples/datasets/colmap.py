@@ -1,15 +1,16 @@
-import json
 import os
 from typing import Any, Dict, List, Optional
 
 import cv2
 import imageio.v2 as imageio
 import numpy as np
+import scipy as sp
+import mediapy as media
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.neighbors import kneighbors_graph
 import torch
-from PIL import Image
+import torch.nn as nn
 from pycolmap_parser.pycolmap_parser.scene_manager import SceneManager
-from tqdm import tqdm
-from typing_extensions import assert_never
 
 from .normalize import (
     align_principal_axes,
@@ -26,31 +27,6 @@ def _get_rel_paths(path_dir: str) -> List[str]:
         for f in fn:
             paths.append(os.path.relpath(os.path.join(dp, f), path_dir))
     return paths
-
-
-def _resize_image_folder(image_dir: str, resized_dir: str, factor: int) -> str:
-    """Resize image folder."""
-    print(f"Downscaling images by {factor}x from {image_dir} to {resized_dir}.")
-    os.makedirs(resized_dir, exist_ok=True)
-
-    image_files = _get_rel_paths(image_dir)
-    for image_file in tqdm(image_files):
-        image_path = os.path.join(image_dir, image_file)
-        resized_path = os.path.join(
-            resized_dir, os.path.splitext(image_file)[0] + ".png"
-        )
-        if os.path.isfile(resized_path):
-            continue
-        image = imageio.imread(image_path)[..., :3]
-        resized_size = (
-            int(round(image.shape[1] / factor)),
-            int(round(image.shape[0] / factor)),
-        )
-        resized_image = np.array(
-            Image.fromarray(image).resize(resized_size, Image.BICUBIC)
-        )
-        imageio.imwrite(resized_path, resized_image)
-    return resized_dir
 
 
 class Parser:
@@ -87,10 +63,35 @@ class Parser:
         Ks_dict = dict()
         params_dict = dict()
         imsize_dict = dict()  # width, height
-        mask_dict = dict()
         bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
+        # Load images.
+        colmap_image_dir = os.path.join(data_dir, "images")
+        if not os.path.exists(colmap_image_dir):
+            raise ValueError(f"Image folder {colmap_image_dir} does not exist.")
+        downsample = False
+        image_extensions = [".JPG", ".jpg", ".PNG", ".png", ".JPEG", ".jpeg"]
+        if factor > 1:
+            image_dir_suffix = f"_{factor}"
+            image_dir = os.path.join(data_dir, "images" + image_dir_suffix)
+            if not os.path.exists(image_dir):
+                print("downsampling and saving the images.")
+                downsample = True
+                os.makedirs(image_dir)
+                
+                all_images = [i for i in os.listdir(colmap_image_dir) if any(i.endswith(ext) for ext in image_extensions)]
+                for im_name in all_images:
+                    im_path = os.path.join(colmap_image_dir, im_name)
+                    im_rgb = media.read_image(im_path)
+                    imsize = (im_rgb.shape[0] // factor, im_rgb.shape[1] // factor)
+                    resize_im = media.resize_image(im_rgb, imsize)
+                    out_path = os.path.join(image_dir, im_name)
+                    media.write_image(out_path, resize_im)
+        else:
+            image_dir = colmap_image_dir
+
         for k in imdata:
             im = imdata[k]
+
             rot = im.R()
             trans = im.tvec.reshape(3, 1)
             w2c = np.concatenate([np.concatenate([rot, trans], 1), bottom], axis=0)
@@ -106,6 +107,7 @@ class Parser:
             K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
             K[:2, :] /= factor
             Ks_dict[camera_id] = K
+            imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)
 
             # Get distortion parameters.
             type_ = cam.camera_type
@@ -116,7 +118,7 @@ class Parser:
                 params = np.empty(0, dtype=np.float32)
                 camtype = "perspective"
             if type_ == 2 or type_ == "SIMPLE_RADIAL":
-                params = np.array([cam.k1, 0.0, 0.0, 0.0], dtype=np.float32)
+                params = np.array([cam.k1, 0, 0, 0.], dtype=np.float32)
                 camtype = "perspective"
             elif type_ == 3 or type_ == "RADIAL":
                 params = np.array([cam.k1, cam.k2, 0.0, 0.0], dtype=np.float32)
@@ -128,12 +130,13 @@ class Parser:
                 params = np.array([cam.k1, cam.k2, cam.k3, cam.k4], dtype=np.float32)
                 camtype = "fisheye"
             assert (
-                camtype == "perspective" or camtype == "fisheye"
-            ), f"Only perspective and fisheye cameras are supported, got {type_}"
+                camtype == "perspective"
+            ), f"Only support perspective camera model, got {type_}"
 
             params_dict[camera_id] = params
-            imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)
-            mask_dict[camera_id] = None
+
+            
+
         print(
             f"[Parser] {len(imdata)} images, taken by {len(set(camera_ids))} cameras."
         )
@@ -141,7 +144,7 @@ class Parser:
         if len(imdata) == 0:
             raise ValueError("No images found in COLMAP.")
         if not (type_ == 0 or type_ == 1):
-            print("Warning: COLMAP Camera is not PINHOLE. Images have distortion.")
+            print(f"Warning: COLMAP Camera is not PINHOLE. Images have distortion.")
 
         w2c_mats = np.stack(w2c_mats, axis=0)
 
@@ -159,42 +162,10 @@ class Parser:
         camtoworlds = camtoworlds[inds]
         camera_ids = [camera_ids[i] for i in inds]
 
-        # Load extended metadata. Used by Bilarf dataset.
-        self.extconf = {
-            "spiral_radius_scale": 1.0,
-            "no_factor_suffix": False,
-        }
-        extconf_file = os.path.join(data_dir, "ext_metadata.json")
-        if os.path.exists(extconf_file):
-            with open(extconf_file) as f:
-                self.extconf.update(json.load(f))
-
-        # Load bounds if possible (only used in forward facing scenes).
-        self.bounds = np.array([0.01, 1.0])
-        posefile = os.path.join(data_dir, "poses_bounds.npy")
-        if os.path.exists(posefile):
-            self.bounds = np.load(posefile)[:, -2:]
-
-        # Load images.
-        if factor > 1 and not self.extconf["no_factor_suffix"]:
-            image_dir_suffix = f"_{factor}"
-        else:
-            image_dir_suffix = ""
-        colmap_image_dir = os.path.join(data_dir, "images")
-        image_dir = os.path.join(data_dir, "images" + image_dir_suffix)
-        for d in [image_dir, colmap_image_dir]:
-            if not os.path.exists(d):
-                raise ValueError(f"Image folder {d} does not exist.")
-
         # Downsampled images may have different names vs images used for COLMAP,
         # so we need to map between the two sorted lists of files.
         colmap_files = sorted(_get_rel_paths(colmap_image_dir))
         image_files = sorted(_get_rel_paths(image_dir))
-        if factor > 1 and os.path.splitext(image_files[0])[1].lower() == ".jpg":
-            image_dir = _resize_image_folder(
-                colmap_image_dir, image_dir + "_png", factor=factor
-            )
-            image_files = sorted(_get_rel_paths(image_dir))
         colmap_to_image = dict(zip(colmap_files, image_files))
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
 
@@ -225,23 +196,6 @@ class Parser:
             points = transform_points(T2, points)
 
             transform = T2 @ T1
-
-            # Fix for up side down. We assume more points towards
-            # the bottom of the scene which is true when ground floor is
-            # present in the images.
-            if np.median(points[:, 2]) > np.mean(points[:, 2]):
-                # rotate 180 degrees around x axis such that z is flipped
-                T3 = np.array(
-                    [
-                        [1.0, 0.0, 0.0, 0.0],
-                        [0.0, -1.0, 0.0, 0.0],
-                        [0.0, 0.0, -1.0, 0.0],
-                        [0.0, 0.0, 0.0, 1.0],
-                    ]
-                )
-                camtoworlds = transform_cameras(T3, camtoworlds)
-                points = transform_points(T3, points)
-                transform = T3 @ transform
         else:
             transform = np.eye(4)
 
@@ -252,20 +206,19 @@ class Parser:
         self.Ks_dict = Ks_dict  # Dict of camera_id -> K
         self.params_dict = params_dict  # Dict of camera_id -> params
         self.imsize_dict = imsize_dict  # Dict of camera_id -> (width, height)
-        self.mask_dict = mask_dict  # Dict of camera_id -> mask
         self.points = points  # np.ndarray, (num_points, 3)
         self.points_err = points_err  # np.ndarray, (num_points,)
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
         self.transform = transform  # np.ndarray, (4, 4)
 
-        # load one image to check the size. In the case of tanksandtemples dataset, the
-        # intrinsics stored in COLMAP corresponds to 2x upsampled images.
+        # Doble check intrinsics! load one image to check the size. 
         actual_image = imageio.imread(self.image_paths[0])[..., :3]
         actual_height, actual_width = actual_image.shape[:2]
         colmap_width, colmap_height = self.imsize_dict[self.camera_ids[0]]
         s_height, s_width = actual_height / colmap_height, actual_width / colmap_width
         for camera_id, K in self.Ks_dict.items():
+            print(colmap_width, actual_width)
             K[0, :] *= s_width
             K[1, :] *= s_height
             self.Ks_dict[camera_id] = K
@@ -286,66 +239,72 @@ class Parser:
             ), f"Missing params for camera {camera_id}"
             K = self.Ks_dict[camera_id]
             width, height = self.imsize_dict[camera_id]
-
-            if camtype == "perspective":
-                K_undist, roi_undist = cv2.getOptimalNewCameraMatrix(
-                    K, params, (width, height), 0
-                )
-                mapx, mapy = cv2.initUndistortRectifyMap(
-                    K, params, None, K_undist, (width, height), cv2.CV_32FC1
-                )
-                mask = None
-            elif camtype == "fisheye":
-                fx = K[0, 0]
-                fy = K[1, 1]
-                cx = K[0, 2]
-                cy = K[1, 2]
-                grid_x, grid_y = np.meshgrid(
-                    np.arange(width, dtype=np.float32),
-                    np.arange(height, dtype=np.float32),
-                    indexing="xy",
-                )
-                x1 = (grid_x - cx) / fx
-                y1 = (grid_y - cy) / fy
-                theta = np.sqrt(x1**2 + y1**2)
-                r = (
-                    1.0
-                    + params[0] * theta**2
-                    + params[1] * theta**4
-                    + params[2] * theta**6
-                    + params[3] * theta**8
-                )
-                mapx = (fx * x1 * r + width // 2).astype(np.float32)
-                mapy = (fy * y1 * r + height // 2).astype(np.float32)
-
-                # Use mask to define ROI
-                mask = np.logical_and(
-                    np.logical_and(mapx > 0, mapy > 0),
-                    np.logical_and(mapx < width - 1, mapy < height - 1),
-                )
-                y_indices, x_indices = np.nonzero(mask)
-                y_min, y_max = y_indices.min(), y_indices.max() + 1
-                x_min, x_max = x_indices.min(), x_indices.max() + 1
-                mask = mask[y_min:y_max, x_min:x_max]
-                K_undist = K.copy()
-                K_undist[0, 2] -= x_min
-                K_undist[1, 2] -= y_min
-                roi_undist = [x_min, y_min, x_max - x_min, y_max - y_min]
-            else:
-                assert_never(camtype)
-
+            K_undist, roi_undist = cv2.getOptimalNewCameraMatrix(
+                K, params, (width, height), 0
+            )
+            mapx, mapy = cv2.initUndistortRectifyMap(
+                K, params, None, K_undist, (width, height), cv2.CV_32FC1
+            )
+            self.Ks_dict[camera_id] = K_undist
             self.mapx_dict[camera_id] = mapx
             self.mapy_dict[camera_id] = mapy
-            self.Ks_dict[camera_id] = K_undist
             self.roi_undist_dict[camera_id] = roi_undist
-            self.imsize_dict[camera_id] = (roi_undist[2], roi_undist[3])
-            self.mask_dict[camera_id] = mask
 
         # size of the scene measured by cameras
         camera_locations = camtoworlds[:, :3, 3]
         scene_center = np.mean(camera_locations, axis=0)
         dists = np.linalg.norm(camera_locations - scene_center, axis=1)
         self.scene_scale = np.max(dists)
+
+
+class SemanticParser(Parser):
+    """COLMAP parser for cluttered scenes."""
+
+    def __init__(
+        self,
+        data_dir: str,
+        factor: int = 1,
+        normalize: bool = False,
+        load_keyword: str = "clutter",
+        semantic_dir: str = "SD",
+        cluster: bool = False,
+    ):
+        super().__init__(
+            data_dir,
+            factor,
+            normalize,
+            -1,
+        )
+        self.features = []
+        imdirectory = "images"
+        if factor > 1:
+            imdirectory = f"images_{factor}"
+        for ind, impath in enumerate(self.image_paths):
+            image_id = self.image_names[ind].split(".")[-2]
+            cid = self.camera_ids[ind]
+            if self.image_names[ind].find(load_keyword) != -1:
+                feature_path = os.path.join(
+                    os.path.join(data_dir, semantic_dir), f"{image_id}.npy"
+                )
+                feature = np.load(feature_path)
+                if cluster:
+                    ft_flat = np.transpose(feature.reshape((1280, 50 * 50)), (1, 0))
+                    x = np.linspace(0, 1, 50)
+                    y = np.linspace(0, 1, 50)
+                    xv, yv = np.meshgrid(x, y)
+                    indxy = np.reshape(np.stack([xv, yv], axis=-1), (50 * 50, 2))
+                    knn_graph = kneighbors_graph(indxy, 8, include_self=False)
+                    model = AgglomerativeClustering(
+                        linkage="ward", connectivity=knn_graph, n_clusters=100
+                    )
+                    model.fit(ft_flat)
+                    feature = np.array(
+                        [model.labels_ == i for i in range(model.n_clusters)],
+                        dtype=np.float32,
+                    ).reshape((model.n_clusters, 50, 50))
+                self.features.append(feature)
+            else:
+                self.features.append([])
 
 
 class Dataset:
@@ -378,7 +337,6 @@ class Dataset:
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
-        mask = self.parser.mask_dict[camera_id]
 
         if len(params) > 0:
             # Images are distorted. Undistort them.
@@ -405,8 +363,6 @@ class Dataset:
             "image": torch.from_numpy(image).float(),
             "image_id": item,  # the index of the image in the dataset
         }
-        if mask is not None:
-            data["mask"] = torch.from_numpy(mask).bool()
 
         if self.load_depths:
             # projected points to image plane to get depths
@@ -418,6 +374,9 @@ class Dataset:
             points_proj = (K @ points_cam.T).T
             points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
             depths = points_cam[:, 2]  # (M,)
+            if self.patch_size is not None:
+                points[:, 0] -= x
+                points[:, 1] -= y
             # filter out points outside the image
             selector = (
                 (points[:, 0] >= 0)
@@ -434,10 +393,60 @@ class Dataset:
         return data
 
 
+class ClutterDataset(Dataset):
+    """A dataset class for cluttered scenes."""
+
+    def __init__(
+        self,
+        parser: Parser,
+        split: str = "train",
+        patch_size: Optional[int] = None,
+        load_depths: bool = False,
+        train_keyword: str = "clutter",
+        test_keyword: str = "extra",
+        semantics: bool = False,
+    ):
+        super().__init__(
+            parser,
+            split,
+            patch_size,
+            load_depths,
+        )
+        indices = np.arange(len(self.parser.image_names))
+        self.semantics = semantics
+        if train_keyword == "":
+            if split == "train":
+                self.indices = indices[indices % self.parser.test_every != 0]
+            else:
+                self.indices = indices[indices % self.parser.test_every == 0]
+        else:
+            if split == "train":
+                self.indices = [
+                    idx
+                    for idx in indices
+                    if self.parser.image_names[idx].find(train_keyword) != -1
+                ]
+            else:
+                self.indices = [
+                    idx
+                    for idx in indices
+                    if self.parser.image_names[idx].find(test_keyword) != -1
+                ]
+
+    def __getitem__(self, item: int) -> Dict[str, Any]:
+        data = super().__getitem__(item)
+        if self.semantics:
+            index = self.indices[item]
+            data["semantics"] = torch.from_numpy(self.parser.features[index]).float()
+
+        return data
+
+
 if __name__ == "__main__":
     import argparse
 
     import imageio.v2 as imageio
+    import tqdm
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="data/360_v2/garden")
@@ -452,7 +461,7 @@ if __name__ == "__main__":
     print(f"Dataset: {len(dataset)} images.")
 
     writer = imageio.get_writer("results/points.mp4", fps=30)
-    for data in tqdm(dataset, desc="Plotting points"):
+    for data in tqdm.tqdm(dataset, desc="Plotting points"):
         image = data["image"].numpy().astype(np.uint8)
         points = data["points"].numpy()
         depths = data["depths"].numpy()
