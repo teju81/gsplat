@@ -85,18 +85,32 @@ def normalize_depth(depth: np.ndarray, depth_min=0.0, depth_max=30.0) -> np.ndar
     #return cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
     return cv2.cvtColor(depth_vis, cv2.COLOR_GRAY2BGR)  # convert to 3-channel BGR for OpenCV annotation
 
+
+class Record_Mode(Enum):
+    PAUSE=0
+    RECORD=1
+    CONTINUE=2
+
 class Recorder:
-    def __init__(self, out_dir=Path("/root/code/output/gaussian_splatting/xgrids_vr/")):
+    def __init__(self, out_dir=Path("/root/code/output/gaussian_splatting/xgrids_vr/"), record_mode=Record_Mode.PAUSE):
+
         self.out_dir = out_dir
         self.save_json_flag = False
-        self.init_recorder()
+        self.pose_data = {}
+        self.noisy_pose_data = {}
+        self.frame_id = 0
+
+        if record_mode == Record_Mode.CONTINUE:
+            self.load_previous_state()
+        else:
+            self.init_recorder()
 
     def init_recorder(self, suffix=""):
         suffix = f"_{suffix}" if suffix else ""
         self.color_dir = self.out_dir / f"color{suffix}"
         self.depth_dir = self.out_dir / f"depth{suffix}"
         self.norm_depth_dir = self.out_dir / f"norm_depth{suffix}"
-        self.json_path = self.out_dir / "poses.json"
+        self.json_path = self.out_dir / f"poses{suffix}.json"
 
         self.pose_data = {}
         self.noisy_pose_data = {}
@@ -105,6 +119,36 @@ class Recorder:
         os.makedirs(self.color_dir, exist_ok=True)
         os.makedirs(self.depth_dir, exist_ok=True)
         os.makedirs(self.norm_depth_dir, exist_ok=True)
+
+        print(f"🔄 Intializing recording....")
+
+
+    def load_previous_state(self):
+        """Resume from previous recording if json exists"""
+        self.json_path = self.out_dir / "poses.json"
+        self.color_dir = self.out_dir / "color"
+        self.depth_dir = self.out_dir / "depth"
+        self.norm_depth_dir = self.out_dir / "norm_depth"
+
+        # Load JSON if it exists
+        if self.json_path.exists():
+            with open(self.json_path, "r") as f:
+                data = json.load(f)
+            self.pose_data = data.get("poses", {})
+            self.noisy_pose_data = data.get("noisy_poses", {})
+
+            # Set frame_id to last + 1
+            if len(self.pose_data) > 0:
+                self.frame_id = max(int(k) for k in self.pose_data.keys()) + 1
+            else:
+                self.frame_id = 0
+        else:
+            self.pose_data = {}
+            self.noisy_pose_data = {}
+            self.frame_id = 0
+
+        print(f"🔄 Resuming recording at frame {self.frame_id}")
+
 
     def record(self, rgb: np.ndarray, depth: np.ndarray, norm_depth: np.ndarray, pose: np.ndarray, noisy_pose: Optional[np.ndarray] = None):
         """
@@ -139,10 +183,8 @@ class Recorder:
         with open(self.json_path, 'w') as f:
             json.dump(all_data, f, indent=4)
 
+        print(f"✅ saved json file to {self.json_path}")
 
-class Record_Mode(Enum):
-    PAUSE=0
-    RECORD=1
 
 class Camera:
     def __init__(self, H=1080, W=1920, fx=1080, fy=1080, near_plane=0.001, far_plane=100.0):
@@ -486,13 +528,13 @@ class VR_APP:
         # 3DGS Renderings
         sh_degree = self.gaussian_model._sh_degree
         renders, alphas, info = self.gaussian_model.rasterize_splats(
-            camtoworlds=cam.T,
-            Ks=cam.Ks,
-            width=cam.W,
-            height=cam.H,
+            camtoworlds=self.cam.T,
+            Ks=self.cam.Ks,
+            width=self.cam.W,
+            height=self.cam.H,
             sh_degree=sh_degree,
-            near_plane=cam.near_plane,
-            far_plane=cam.far_plane,
+            near_plane=self.cam.near_plane,
+            far_plane=self.cam.far_plane,
             image_ids=image_ids,
             render_mode="RGB+D",
             masks=masks,
@@ -513,7 +555,8 @@ class VR_APP:
         pygame.mouse.set_visible(False)
 
         clock = pygame.time.Clock()
-        if record_mode == Record_Mode.RECORD:
+        if record_mode in [Record_Mode.RECORD, Record_Mode.CONTINUE]:
+            record_mode = Record_Mode.PAUSE
             self.recorder.save_json_flag = True
 
         running = True
@@ -529,7 +572,7 @@ class VR_APP:
                         if record_mode == Record_Mode.PAUSE:
                             record_mode = Record_Mode.RECORD
                             self.recorder.save_json_flag = True
-                        elif record_mode == Record_Mode.RECORD:
+                        elif record_mode in [Record_Mode.RECORD, Record_Mode.CONTINUE]:
                             record_mode = Record_Mode.PAUSE
                 # elif event.type == pygame.MOUSEMOTION:
                 #     handle_mouse_input(event)
@@ -537,7 +580,7 @@ class VR_APP:
             self.cam.pygame_move_camera()
 
             # === Call the Gaussian Rasterizer ===
-            colors, depths = rasterize_rgbd(self.cam, self.gaussian_model)
+            colors, depths = self.rasterize_rgbd()
 
             # # Convert to CPU and numpy
             rendered_rgb_3dgs = colors[0].clamp(0, 1).detach().cpu().numpy()  # [H, W, 3]
@@ -547,6 +590,7 @@ class VR_APP:
             rgb_vis_3dgs = (rendered_rgb_3dgs * 255).astype(np.uint8)
             rgb_game_img = rgb_vis_3dgs.copy()
             cv2.putText(rgb_game_img, f"Record Mode: {record_mode}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+            rgb_vis_3dgs_bgr = cv2.cvtColor(rgb_vis_3dgs, cv2.COLOR_RGB2BGR)
             depth_min = rendered_depth_3dgs.min()
             depth_max = rendered_depth_3dgs.max()
             depth_vis_3dgs = normalize_depth(rendered_depth_3dgs, depth_min, depth_max)
@@ -554,8 +598,8 @@ class VR_APP:
 
             pose = self.cam.T.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
-            if record_mode == Record_Mode.RECORD:
-                self.recorder.record(rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs, pose)
+            if record_mode in [Record_Mode.RECORD, Record_Mode.CONTINUE]:
+                self.recorder.record(rgb_vis_3dgs_bgr, rendered_depth_3dgs, depth_vis_3dgs, pose)
 
             # === Display the output image ===
             # Convert the NumPy array to a Pygame surface
@@ -573,7 +617,6 @@ class VR_APP:
             self.recorder.save_json()
 
         pygame.quit()
-        sys.exit()
 
     def perturb_pose(self, pose: np.ndarray):
         """
@@ -595,7 +638,7 @@ class VR_APP:
         noisy_pose[:3, 3] = noisy_t
         return noisy_pose
 
-    def replay_with_noise(self, pose_file=None):
+    def replay_with_noise(self, pose_file=None, suffix="noisy"):
 
         # Assuming one vr walk is already done
         # with open(self.recorder.json_path, 'r') as f:
@@ -604,11 +647,22 @@ class VR_APP:
         if pose_file:
             # Load trajectory from a pose file
             traj = self.load_poses(pose_file=pose_file, file_type="csv")
-            self.recorder.init_recorder(suffix="noisy_training")
+            self.recorder.init_recorder(suffix=f"{suffix}_training")
         else:
+            # Load JSON
+            if not self.recorder.pose_data:
+                self.recorder.init_recorder() # Get the paths
+                # Fetch original poses
+                print(self.recorder.json_path)
+                if self.recorder.json_path.exists():
+                    with open(self.recorder.json_path, "r") as f:
+                        data = json.load(f)
+
             # Load pose from trajectory recorded in vr walkthrough
-            traj = self.recorder.pose_data
-            self.recorder.init_recorder(suffix="noisy")
+            self.recorder.init_recorder(suffix=suffix)
+
+            traj = data.get("poses", {})
+
 
         for frame_id, pose in traj.items():
             pose = np.array(pose, dtype=np.float32)
@@ -618,7 +672,7 @@ class VR_APP:
 
             self.cam.T = torch.from_numpy(noisy_pose).unsqueeze(0).cuda()
 
-            colors, depths = rasterize_rgbd(self.cam, self.gaussian_model)
+            colors, depths = self.rasterize_rgbd()
 
             # # Convert to CPU and numpy
             rendered_rgb_3dgs = colors[0].clamp(0, 1).detach().cpu().numpy()  # [H, W, 3]
@@ -626,14 +680,13 @@ class VR_APP:
 
             # === Convert to displayable format ===
             rgb_vis_3dgs = (rendered_rgb_3dgs * 255).astype(np.uint8)
+            rgb_vis_3dgs_bgr = cv2.cvtColor(rgb_vis_3dgs, cv2.COLOR_RGB2BGR)
             depth_min = rendered_depth_3dgs.min()
             depth_max = rendered_depth_3dgs.max()
             depth_vis_3dgs = normalize_depth(rendered_depth_3dgs, depth_min, depth_max)
 
 
-            self.recorder.record(rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs, pose, noisy_pose)
-
-            # self.recorder.record(rendered_rgb, rendered_depth, norm_depth, pose, noisy_pose)
+            self.recorder.record(rgb_vis_3dgs_bgr, rendered_depth_3dgs, depth_vis_3dgs, pose, noisy_pose)
 
         self.recorder.save_json()
         print(f"✅ Replay with noise saved to {self.recorder.out_dir.name}")
@@ -1049,17 +1102,30 @@ def main():
     # vr_walkthrough_pygame(gaussian_model)
 
     cam = init_cam()
-    out_dir = Path("/root/code/output/gaussian_splatting/feature_data/")
-    recorder = Recorder(out_dir)
+    out_dir = Path("/root/code/output/gaussian_splatting/xgrids_test1/")
+    
+    #record_mode = Record_Mode.CONTINUE
     record_mode = Record_Mode.PAUSE
 
+    recorder = Recorder(out_dir, record_mode)
+    
     vr_app = VR_APP(cam, gaussian_model, recorder)
 
 
     # # First interactively record trajectory
-    vr_app.vr_walkthrough_pygame(record_mode)
-    # print("Wak through is done... Replay with noise now....")
-    # vr_app.replay_with_noise()
+    #vr_app.vr_walkthrough_pygame(record_mode)
+    print("Walk through is done... Replay with noise now....")
+
+    # #Define noise parameters for replaying training/recorded trajectories with noise injected
+    # vr_app.trans_noise=0.1
+    # vr_app.rot_noise_deg=5.0
+    # vr_app.replay_with_noise(suffix="noisy1")
+    # print("Replay with noise done.... Replaying another time with more noise...")
+
+    vr_app.trans_noise=0.2
+    vr_app.rot_noise_deg=10.0
+    vr_app.replay_with_noise(suffix="noisy2")
+    print("Replay with more noise done....")
 
 
     # # Option 3: Replay training poses with noise
