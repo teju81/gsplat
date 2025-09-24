@@ -478,6 +478,30 @@ class VR_APP:
         self.trans_noise=0.1
         self.rot_noise_deg=5.0
 
+    def rasterize_rgbd(self):
+
+        image_ids = torch.tensor([0], dtype=torch.long)  # Shape: [1]
+        masks = torch.ones((1, self.cam.H, self.cam.W, 4), dtype=torch.bool)  # Shape: [1, 1080, 1920, 4]
+
+        # 3DGS Renderings
+        sh_degree = self.gaussian_model._sh_degree
+        renders, alphas, info = self.gaussian_model.rasterize_splats(
+            camtoworlds=cam.T,
+            Ks=cam.Ks,
+            width=cam.W,
+            height=cam.H,
+            sh_degree=sh_degree,
+            near_plane=cam.near_plane,
+            far_plane=cam.far_plane,
+            image_ids=image_ids,
+            render_mode="RGB+D",
+            masks=masks,
+        )
+        colors, depths = renders[..., 0:3], renders[..., 3:4]
+
+
+        return colors, depths
+
     def vr_walkthrough_pygame(self, record_mode):
 
         pygame.init()
@@ -697,31 +721,6 @@ def render_rgbd_from_obj(cam, obj_path):
     depth_np = np.asarray(depth)
 
     return color_np, depth_np
-
-
-def rasterize_rgbd(cam, gaussian_model):
-
-    image_ids = torch.tensor([0], dtype=torch.long)  # Shape: [1]
-    masks = torch.ones((1, cam.H, cam.W, 4), dtype=torch.bool)  # Shape: [1, 1080, 1920, 4]
-
-    # 3DGS Renderings
-    sh_degree = gaussian_model._sh_degree
-    renders, alphas, info = gaussian_model.rasterize_splats(
-        camtoworlds=cam.T,
-        Ks=cam.Ks,
-        width=cam.W,
-        height=cam.H,
-        sh_degree=sh_degree,
-        near_plane=cam.near_plane,
-        far_plane=cam.far_plane,
-        image_ids=image_ids,
-        render_mode="RGB+D",
-        masks=masks,
-    )
-    colors, depths = renders[..., 0:3], renders[..., 3:4]
-
-
-    return colors, depths
 
 
 
@@ -1050,7 +1049,7 @@ def main():
     # vr_walkthrough_pygame(gaussian_model)
 
     cam = init_cam()
-    out_dir = Path("/root/code/output/gaussian_splatting/xgrids_vr3/")
+    out_dir = Path("/root/code/output/gaussian_splatting/feature_data/")
     recorder = Recorder(out_dir)
     record_mode = Record_Mode.PAUSE
 
