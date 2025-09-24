@@ -23,6 +23,7 @@ import glm # We'll use PyGLM for easier matrix math
 import sys
 import os
 from pathlib import Path
+from enum import Enum
 
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
@@ -87,6 +88,7 @@ def normalize_depth(depth: np.ndarray, depth_min=0.0, depth_max=30.0) -> np.ndar
 class Recorder:
     def __init__(self, out_dir=Path("/root/code/output/gaussian_splatting/xgrids_vr/")):
         self.out_dir = out_dir
+        self.save_json_flag = False
         self.init_recorder()
 
     def init_recorder(self, suffix=""):
@@ -136,6 +138,11 @@ class Recorder:
         }
         with open(self.json_path, 'w') as f:
             json.dump(all_data, f, indent=4)
+
+
+class Record_Mode(Enum):
+    PAUSE=0
+    RECORD=1
 
 class Camera:
     def __init__(self, H=1080, W=1920, fx=1080, fy=1080, near_plane=0.001, far_plane=100.0):
@@ -259,7 +266,6 @@ class Camera:
 
         return
 
-
     def pygame_move_camera(self):
         keys = pygame.key.get_pressed()
         
@@ -302,6 +308,9 @@ class Camera:
         if keys[K_o]:
             yaw += 1.0
             self.rotate_camera(roll, pitch, yaw)
+
+
+        # print(f"x: {self.x}, y:{self.y}, z:{self.z}")
 
         return
 
@@ -469,7 +478,7 @@ class VR_APP:
         self.trans_noise=0.1
         self.rot_noise_deg=5.0
 
-    def vr_walkthrough_pygame(self, is_record=False):
+    def vr_walkthrough_pygame(self, record_mode):
 
         pygame.init()
         display_width, display_height = self.cam.W, self.cam.H
@@ -480,6 +489,9 @@ class VR_APP:
         pygame.mouse.set_visible(False)
 
         clock = pygame.time.Clock()
+        if record_mode == Record_Mode.RECORD:
+            self.recorder.save_json_flag = True
+
         running = True
         
         while running:
@@ -489,6 +501,12 @@ class VR_APP:
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         running = False
+                    elif event.key == pygame.K_SPACE:
+                        if record_mode == Record_Mode.PAUSE:
+                            record_mode = Record_Mode.RECORD
+                            self.recorder.save_json_flag = True
+                        elif record_mode == Record_Mode.RECORD:
+                            record_mode = Record_Mode.PAUSE
                 # elif event.type == pygame.MOUSEMOTION:
                 #     handle_mouse_input(event)
 
@@ -503,6 +521,8 @@ class VR_APP:
 
             # === Convert to displayable format ===
             rgb_vis_3dgs = (rendered_rgb_3dgs * 255).astype(np.uint8)
+            rgb_game_img = rgb_vis_3dgs.copy()
+            cv2.putText(rgb_game_img, f"Record Mode: {record_mode}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
             depth_min = rendered_depth_3dgs.min()
             depth_max = rendered_depth_3dgs.max()
             depth_vis_3dgs = normalize_depth(rendered_depth_3dgs, depth_min, depth_max)
@@ -510,14 +530,14 @@ class VR_APP:
 
             pose = self.cam.T.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
-            if is_record:
+            if record_mode == Record_Mode.RECORD:
                 self.recorder.record(rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs, pose)
 
             # === Display the output image ===
             # Convert the NumPy array to a Pygame surface
             # The swapaxes() is crucial because NumPy arrays and Pygame surfaces have different memory layouts.
             # NumPy is (height, width, channels), Pygame is (width, height, channels).
-            image_surface = pygame.surfarray.make_surface(rgb_vis_3dgs.swapaxes(0, 1))
+            image_surface = pygame.surfarray.make_surface(rgb_game_img.swapaxes(0, 1))
 
             # Blit the surface to the screen
             screen.blit(image_surface, (0, 0))
@@ -525,11 +545,11 @@ class VR_APP:
             pygame.display.flip()
             clock.tick(60)
 
-        if is_record:
+        if self.recorder.save_json_flag:
             self.recorder.save_json()
 
         pygame.quit()
-        # sys.exit()
+        sys.exit()
 
     def perturb_pose(self, pose: np.ndarray):
         """
@@ -997,6 +1017,9 @@ def init_cam():
 
     # Track position and orientation of the camera over time
     tx, ty, tz, roll, pitch, yaw = 0, 0, 0, 0, 0, 0
+
+    tx, ty, tz = -2.3, -0.08, 4.09
+    roll, pitch, yaw = 0, -90, -90
     cam.set_camera_viewpoint(tx, ty, tz, roll, pitch, yaw)
 
     return cam
@@ -1006,8 +1029,14 @@ def main():
     # parser.add_argument("--render_video", type=bool, default=False, help="Render Video or Images")
     # args = parser.parse_args()
 
+    # sh_degree = 3
+    # ply_file_path="/root/code/extra1/datasets/ARTGarage/xgrids/4/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply"
+
     sh_degree = 3
-    ply_file_path="/root/code/extra1/datasets/ARTGarage/xgrids/4/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply"
+    ply_file_path="/root/code/datasets/xgrids/LCC_output/AG_Office/ply-result/point_cloud/iteration_100/point_cloud.ply"
+
+    # sh_degree = 3
+    # ply_file_path="/root/code/datasets/xgrids/LCC_output/AG_lab/ply-result/point_cloud/iteration_100/point_cloud.ply"
 
     #sh_degree = 0
     #ply_file_path="/root/code/datasets/xgrids/LCC_output/portal_cam_output_LCC/output/ply-result/point_cloud/iteration_100/point_cloud_1.ply"
@@ -1023,19 +1052,20 @@ def main():
     cam = init_cam()
     out_dir = Path("/root/code/output/gaussian_splatting/xgrids_vr3/")
     recorder = Recorder(out_dir)
+    record_mode = Record_Mode.PAUSE
 
     vr_app = VR_APP(cam, gaussian_model, recorder)
 
 
     # # First interactively record trajectory
-    # vr_app.vr_walkthrough_pygame(is_record=True)
+    vr_app.vr_walkthrough_pygame(record_mode)
     # print("Wak through is done... Replay with noise now....")
     # vr_app.replay_with_noise()
 
 
-    # Option 3: Replay training poses with noise
-    training_pose_file = "/root/code/extra1/datasets/ARTGarage/xgrids/1/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/img_traj.csv"
-    vr_app.replay_with_noise(training_pose_file)
+    # # Option 3: Replay training poses with noise
+    # training_pose_file = "/root/code/extra1/datasets/ARTGarage/xgrids/1/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/img_traj.csv"
+    # vr_app.replay_with_noise(training_pose_file)
 
 if __name__ == "__main__":
     main()
