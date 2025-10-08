@@ -25,6 +25,17 @@ import os
 from pathlib import Path
 from enum import Enum
 
+import supervision as sv
+import pycocotools.mask as mask_util
+from torchvision.ops import box_convert
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+from grounding_dino.groundingdino.util.inference import load_model, load_image, predict
+from PIL import Image
+import random
+
+
+
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
 
@@ -506,6 +517,241 @@ class GaussianModel:
         if masks is not None:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
+
+class SplatSegmenter:
+    def __init__(self):
+
+        """
+        Hyper parameters
+        """
+        self.text = "floor. wall. plants. door. window. fan. chair. machine. fire extinguisher. shoe rack. traffic cone. chain."
+
+        self.class_names = [cls.strip().rstrip('.') for cls in self.text.split('.') if cls.strip()]
+
+        # === Create consistent color map across runs ===
+        random.seed(42)  # ensure same colors every run
+        self.CLASS_COLOR_MAP = {
+            cls: sv.Color(random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+            for cls in self.class_names
+        }
+
+
+        self.sam2_checkpoint = "/root/code/langsam/checkpoints/sam2.1_hiera_large.pt"
+        self.model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+        self.GROUNDING_DINO_CONFIG = "/root/code/langsam/grounding_dino/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+        self.GROUNDING_DINO_CHECKPOINT = "/root/code/langsam/gdino_checkpoints/groundingdino_swint_ogc.pth"
+        self.BOX_THRESHOLD = 0.35
+        self.TEXT_THRESHOLD = 0.25
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.OUTPUT_DIR = Path("/root/code/output/grounded_sam2_local_demo")
+
+        # create output directory
+        self.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+
+        # build SAM2 image predictor
+        self.sam2_model = build_sam2(self.model_cfg, self.sam2_checkpoint, device=self.device)
+        self.sam2_predictor = SAM2ImagePredictor(self.sam2_model)
+
+        # build grounding dino model
+        self.grounding_model = load_model(
+            model_config_path=self.GROUNDING_DINO_CONFIG, 
+            model_checkpoint_path=self.GROUNDING_DINO_CHECKPOINT,
+            device=self.device
+        )
+
+    def segment_splat_image_dir(self, image_dir=None):
+
+        """
+        Run LangSAM segmentation on all images in a directory.
+        """
+
+        image_dir = Path(image_dir)
+        image_dir = image_dir / "color"
+        assert image_dir.exists(), f"❌ Directory not found: {image_dir}"
+
+
+
+        # Supported image formats
+        extensions = [".jpg", ".jpeg", ".png"]
+
+        # # Loop over images
+        # for img_path in sorted(image_dir.glob("*")):
+        #     if img_path.suffix.lower() not in extensions:
+        #         continue  # skip non-image files
+
+        #     print(f"🔹 Processing: {img_path.name}")
+
+
+        # list all images
+        for img_path in sorted(image_dir.iterdir()):
+            if img_path.suffix.lower() not in extensions:
+                continue  # skip non-image files
+
+            print(f"🔹 Processing: {img_path}")
+
+            # Run LangSAM segmentation
+            self.langsam_gaussian_segmenter(img_path)
+
+    def langsam_gaussian_segmenter(self, img_path="/root/code/datasets/ARTGarage/segmentation_assets/artgarage_warehouse.png"):
+
+        image_source, image = load_image(img_path)
+
+        # environment settings
+        # use bfloat16
+
+
+
+        # setup the input image and text prompt for SAM 2 and Grounding DINO
+        # VERY important: text queries need to be lowercased + end with a dot
+        
+
+        # Grounding DINO
+
+        self.sam2_predictor.set_image(image_source)
+
+        with torch.autocast(device_type=self.device, dtype=torch.float32):
+            boxes, confidences, labels = predict(
+                model=self.grounding_model,
+                image=image,
+                caption=self.text,
+                box_threshold=self.BOX_THRESHOLD,
+                text_threshold=self.TEXT_THRESHOLD,
+                device=self.device
+            )
+
+        # process the box prompt for SAM 2
+        h, w, _ = image_source.shape
+        boxes = boxes * torch.Tensor([w, h, w, h])
+        input_boxes = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
+
+        # # FIXME: figure how does this influence the G-DINO model
+        # torch.autocast(device_type=self.device, dtype=torch.bfloat16).__enter__()
+
+        if torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 8:
+            # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            autocast_dtype = torch.bfloat16
+        else:
+            autocast_dtype = torch.float32
+
+        with torch.autocast(device_type=self.device, dtype=autocast_dtype):
+            masks, scores, logits = self.sam2_predictor.predict(
+                point_coords=None,
+                point_labels=None,
+                box=input_boxes,
+                multimask_output=False,
+            )
+
+        """
+        Post-process the output of the model to get the masks, scores, and logits for visualization
+        """
+        # convert the shape to (n, H, W)
+        if masks.ndim == 4:
+            masks = masks.squeeze(1)
+
+        confidences = confidences.numpy().tolist()
+        class_names = labels
+
+        class_ids = np.array(list(range(len(class_names))))
+
+        labels = [
+            f"{class_name} {confidence:.2f}"
+            for class_name, confidence
+            in zip(class_names, confidences)
+        ]
+
+        """
+        Visualize image with supervision useful API
+        """
+
+        img = cv2.imread(str(img_path))
+        detections = sv.Detections(
+            xyxy=input_boxes,
+            mask=masks.astype(bool),
+            class_id=class_ids
+        )
+
+        # --- Compute per-detection colors manually ---
+        colors = []
+        for class_id in detections.class_id:
+            cls = class_names[int(class_id)] if class_id < len(class_names) else "unknown"
+            color = self.CLASS_COLOR_MAP.get(cls, sv.Color(255, 255, 255))
+            colors.append(color.as_bgr())
+
+        # --- Draw boxes and masks ---
+        annotated_frame = img.copy()
+
+        # Draw bounding boxes and labels
+        for i, box in enumerate(detections.xyxy):
+            x1, y1, x2, y2 = map(int, box)
+            color = colors[i]
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+            label_text = labels[i] if i < len(labels) else ""
+            cv2.putText(
+                annotated_frame, label_text,
+                (x1, max(20, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, color, 2
+            )
+
+        # Apply colored masks
+        for i, mask in enumerate(detections.mask):
+            color = colors[i]
+            colored_mask = np.zeros_like(annotated_frame)
+            colored_mask[mask] = color
+            annotated_frame = cv2.addWeighted(annotated_frame, 1.0, colored_mask, 0.4, 0)
+
+        # ============================
+        # 🟦 ADD VISUAL LEGEND ON RIGHT
+        # ============================
+
+        legend_font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.6
+        font_thickness = 2
+        swatch_size = 25
+        line_spacing = 10
+        text_color = (255, 255, 255)
+
+        # Compute legend dimensions
+        legend_entries = list(self.CLASS_COLOR_MAP.items())
+        legend_height = (swatch_size + line_spacing) * len(legend_entries) + 40
+        legend_width = 300
+
+        # Match image height
+        img_h, img_w = annotated_frame.shape[:2]
+        legend_img = np.zeros((img_h, legend_width, 3), dtype=np.uint8)
+
+        # Fill legend background (dark gray)
+        legend_img[:] = (30, 30, 30)
+
+        # Draw title
+        cv2.putText(legend_img, "Legend", (20, 35), legend_font, 0.8, (200, 200, 200), 2)
+
+        # Draw color swatches and labels
+        y0 = 70
+        for cls, color in legend_entries:
+            bgr = color.as_bgr()
+            # Draw color box
+            cv2.rectangle(legend_img, (20, y0), (20 + swatch_size, y0 + swatch_size), bgr, -1)
+            # Write class name
+            cv2.putText(legend_img, cls, (60, y0 + swatch_size - 5), legend_font, font_scale, text_color, font_thickness)
+            y0 += swatch_size + line_spacing
+
+        # Combine horizontally
+        final_display = np.hstack([annotated_frame, legend_img])
+
+        # ============================
+        # 🖼️ Display
+        # ============================
+        cv2.namedWindow("grounded_sam2", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("grounded_sam2", 1600, 720)
+        cv2.imshow("grounded_sam2", final_display)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+
 
 
 
@@ -1070,13 +1316,18 @@ def init_cam():
     # Track position and orientation of the camera over time
     tx, ty, tz, roll, pitch, yaw = 0, 0, 0, 0, 0, 0
 
-    tx, ty, tz = -2.3, -0.08, 4.09
-    roll, pitch, yaw = 0, -90, -90
+
+    tx, ty, tz = 2, -1, 1
+    roll, pitch, yaw = 0, 180, -90
+
+    # Use this initialization for the VR app (first floor origin near stairs)
+    # tx, ty, tz = -2.3, -0.08, 4.09 
+    # roll, pitch, yaw = 0, -90, -90
     cam.set_camera_viewpoint(tx, ty, tz, roll, pitch, yaw)
 
     return cam
 
-def main():
+def vr_app_main():
     # parser = argparse.ArgumentParser(description="Load trained Gaussian Splat stored as a ply file and render RGBD images.")
     # parser.add_argument("--render_video", type=bool, default=False, help="Render Video or Images")
     # args = parser.parse_args()
@@ -1085,10 +1336,11 @@ def main():
     # ply_file_path="/root/code/extra1/datasets/ARTGarage/xgrids/4/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply"
 
     sh_degree = 3
-    ply_file_path="/root/code/datasets/xgrids/LCC_output/AG_Office/ply-result/point_cloud/iteration_100/point_cloud.ply"
+    #ply_file_path="/root/code/datasets/xgrids/LCC_output/AG_Office/ply-result/point_cloud/iteration_100/point_cloud.ply"
+    ply_file_path="/root/code/datasets/ARTGarage/lab_office_in_out_k1_scanner/output/LCC_Studio_GaussianSplat_out/AG_lab/ply-result/point_cloud/iteration_100/point_cloud.ply"
 
     # sh_degree = 3
-    # ply_file_path="/root/code/datasets/xgrids/LCC_output/AG_lab/ply-result/point_cloud/iteration_100/point_cloud.ply"
+    # ply_file_path="/root/code/datasets/ARTGarage/lab_office_in_out_k1_scanner/LCC_Studio_GaussianSplat_out/AG_lab/ply-result/point_cloud/iteration_100/point_cloud.ply"
 
     #sh_degree = 0
     #ply_file_path="/root/code/datasets/xgrids/LCC_output/portal_cam_output_LCC/output/ply-result/point_cloud/iteration_100/point_cloud_1.ply"
@@ -1112,8 +1364,8 @@ def main():
     vr_app = VR_APP(cam, gaussian_model, recorder)
 
 
-    # # First interactively record trajectory
-    #vr_app.vr_walkthrough_pygame(record_mode)
+    # First interactively record trajectory
+    vr_app.vr_walkthrough_pygame(record_mode)
     print("Walk through is done... Replay with noise now....")
 
     # #Define noise parameters for replaying training/recorded trajectories with noise injected
@@ -1122,15 +1374,64 @@ def main():
     # vr_app.replay_with_noise(suffix="noisy1")
     # print("Replay with noise done.... Replaying another time with more noise...")
 
-    vr_app.trans_noise=0.2
-    vr_app.rot_noise_deg=10.0
-    vr_app.replay_with_noise(suffix="noisy2")
-    print("Replay with more noise done....")
+    # vr_app.trans_noise=0.2
+    # vr_app.rot_noise_deg=10.0
+    # vr_app.replay_with_noise(suffix="noisy2")
+    # print("Replay with more noise done....")
 
 
     # # Option 3: Replay training poses with noise
     # training_pose_file = "/root/code/extra1/datasets/ARTGarage/xgrids/1/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/img_traj.csv"
     # vr_app.replay_with_noise(training_pose_file)
+
+
+def gaussian_segmenter_main():
+    # parser = argparse.ArgumentParser(description="Load trained Gaussian Splat stored as a ply file and render RGBD images.")
+    # parser.add_argument("--render_video", type=bool, default=False, help="Render Video or Images")
+    # args = parser.parse_args()
+
+    # sh_degree = 3
+    # ply_file_path="/root/code/extra1/datasets/ARTGarage/xgrids/4/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply"
+
+    sh_degree = 3
+    #ply_file_path="/root/code/datasets/xgrids/LCC_output/AG_Office/ply-result/point_cloud/iteration_100/point_cloud.ply"
+    ply_file_path="/root/code/datasets/ARTGarage/lab_office_in_out_k1_scanner/output/LCC_Studio_GaussianSplat_out/AG_lab/ply-result/point_cloud/iteration_100/point_cloud.ply"
+
+    # sh_degree = 3
+    # ply_file_path="/root/code/datasets/ARTGarage/lab_office_in_out_k1_scanner/LCC_Studio_GaussianSplat_out/AG_lab/ply-result/point_cloud/iteration_100/point_cloud.ply"
+
+    #sh_degree = 0
+    #ply_file_path="/root/code/datasets/xgrids/LCC_output/portal_cam_output_LCC/output/ply-result/point_cloud/iteration_100/point_cloud_1.ply"
+
+    
+    gaussian_model = GaussianModel(sh_degree, ply_file_path)
+
+    cam = init_cam()
+    out_dir = Path("/root/code/output/gaussian_splatting/xgrids_test1/")
+
+
+    #record_mode = Record_Mode.CONTINUE
+    record_mode = Record_Mode.PAUSE
+
+    recorder = Recorder(out_dir, record_mode)
+    
+    vr_app = VR_APP(cam, gaussian_model, recorder)
+
+
+    # # First interactively record trajectory
+    # vr_app.vr_walkthrough_pygame(record_mode)
+
+    splat_segmenter = SplatSegmenter()
+
+
+    splat_segmenter.segment_splat_image_dir(out_dir)
+
+def main():
+    #vr_app_main()
+
+    gaussian_segmenter_main()
+    print("Running Splat Segmenter....")
+
 
 if __name__ == "__main__":
     main()
