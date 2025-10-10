@@ -761,7 +761,7 @@ class SplatSegmenter:
 
         return final_display          
 
-class VR_APP:
+class SPLAT_APP:
     def __init__(self, cam, gaussian_model, recorder):
 
         self.gaussian_model = gaussian_model
@@ -803,6 +803,32 @@ class VR_APP:
 
         return colors, depths
 
+    def rasterize_images_and_segment(self):
+
+        # === Call the Gaussian Rasterizer ===
+        colors, depths = self.rasterize_rgbd()
+
+        # # Convert to CPU and numpy
+        rendered_rgb_3dgs = colors[0].clamp(0, 1).detach().cpu().numpy()  # [H, W, 3]
+        rendered_depth_3dgs = depths[0].squeeze(2).detach().cpu().numpy()  # [H, W]
+
+        # === Convert to displayable format ===
+        rgb_vis_3dgs = (rendered_rgb_3dgs * 255).astype(np.uint8)
+
+        depth_min = rendered_depth_3dgs.min()
+        depth_max = rendered_depth_3dgs.max()
+        depth_vis_3dgs = normalize_depth(rendered_depth_3dgs, depth_min, depth_max)
+
+
+        rgb_vis_3dgs_bgr = cv2.cvtColor(rgb_vis_3dgs, cv2.COLOR_RGB2BGR)
+        
+        # image_pil = Image.fromarray(rgb_vis_3dgs_bgr) 
+        # image_transformed, _ = self.transform(image_pil, None)
+        # seg_img = self.splat_segmenter.langsam_gaussian_segmenter(rgb_vis_3dgs_bgr, image_transformed)
+        seg_img = None
+
+        return rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs, seg_img
+
     def vr_walkthrough_pygame(self, record_mode):
 
         pygame.init()
@@ -819,7 +845,7 @@ class VR_APP:
             self.recorder.save_json_flag = True
 
         running = True
-        
+
         while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -838,30 +864,9 @@ class VR_APP:
 
             self.cam.pygame_move_camera()
 
-            # === Call the Gaussian Rasterizer ===
-            colors, depths = self.rasterize_rgbd()
-
-            # # Convert to CPU and numpy
-            rendered_rgb_3dgs = colors[0].clamp(0, 1).detach().cpu().numpy()  # [H, W, 3]
-            rendered_depth_3dgs = depths[0].squeeze(2).detach().cpu().numpy()  # [H, W]
-
-            # === Convert to displayable format ===
-            rgb_vis_3dgs = (rendered_rgb_3dgs * 255).astype(np.uint8)
-            rgb_game_img = rgb_vis_3dgs.copy()
-            cv2.putText(rgb_game_img, f"Record Mode: {record_mode}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-            rgb_vis_3dgs_bgr = cv2.cvtColor(rgb_vis_3dgs, cv2.COLOR_RGB2BGR)
-
-
-            # image_pil = Image.fromarray(rgb_vis_3dgs_bgr) 
-            # image_transformed, _ = self.transform(image_pil, None)
-            # seg_img = self.splat_segmenter.langsam_gaussian_segmenter(rgb_vis_3dgs_bgr, image_transformed)
-
-            depth_min = rendered_depth_3dgs.min()
-            depth_max = rendered_depth_3dgs.max()
-            depth_vis_3dgs = normalize_depth(rendered_depth_3dgs, depth_min, depth_max)
-
-
             pose = self.cam.T.squeeze(0).detach().cpu().numpy().astype(np.float32)
+
+            rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs, seg_img = self.rasterize_images_and_segment()
 
             if record_mode in [Record_Mode.RECORD, Record_Mode.CONTINUE]:
                 #self.recorder.record(rgb=rgb_vis_3dgs_bgr, depth=rendered_depth_3dgs, norm_depth=depth_vis_3dgs, pose=pose, seg=seg_img)
@@ -871,6 +876,10 @@ class VR_APP:
             # Convert the NumPy array to a Pygame surface
             # The swapaxes() is crucial because NumPy arrays and Pygame surfaces have different memory layouts.
             # NumPy is (height, width, channels), Pygame is (width, height, channels).
+
+            rgb_game_img = rgb_vis_3dgs.copy()
+            cv2.putText(rgb_game_img, f"Record Mode: {record_mode}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+
             image_surface = pygame.surfarray.make_surface(rgb_game_img.swapaxes(0, 1))
 
             # Blit the surface to the screen
@@ -1347,7 +1356,7 @@ def init_cam():
 
     return cam
 
-def vr_app_main(sh_degree, ply_file_path, out_dir):
+def splat_app_main(sh_degree, ply_file_path, out_dir):
     
     gaussian_model = GaussianModel(sh_degree, ply_file_path)
 
@@ -1358,36 +1367,32 @@ def vr_app_main(sh_degree, ply_file_path, out_dir):
 
     recorder = Recorder(out_dir, record_mode)
     
-    vr_app = VR_APP(cam, gaussian_model, recorder)
+    splat_app = SPLAT_APP(cam, gaussian_model, recorder)
 
 
     # First interactively record trajectory
-    vr_app.vr_walkthrough_pygame(record_mode)
+    splat_app.vr_walkthrough_pygame(record_mode)
     print("Walk through is done... Replay with noise now....")
 
     # #Define noise parameters for replaying training/recorded trajectories with noise injected
-    # vr_app.trans_noise=0.1
-    # vr_app.rot_noise_deg=5.0
-    # vr_app.replay_with_noise(suffix="noisy1")
+    # splat_app.trans_noise=0.1
+    # splat_app.rot_noise_deg=5.0
+    # splat_app.replay_with_noise(suffix="noisy1")
     # print("Replay with noise done.... Replaying another time with more noise...")
 
-    # vr_app.trans_noise=0.2
-    # vr_app.rot_noise_deg=10.0
-    # vr_app.replay_with_noise(suffix="noisy2")
+    # splat_app.trans_noise=0.2
+    # splat_app.rot_noise_deg=10.0
+    # splat_app.replay_with_noise(suffix="noisy2")
     # print("Replay with more noise done....")
 
 
     # # Option 3: Replay training poses with noise
     # training_pose_file = "/root/code/extra1/datasets/ARTGarage/xgrids/1/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/img_traj.csv"
-    # vr_app.replay_with_noise(training_pose_file)
+    # splat_app.replay_with_noise(training_pose_file)
 
 
-def gaussian_segmenter_main(sh_degree, ply_file_path, out_dir):
+def gaussian_segmenter_main(out_dir):
     
-    gaussian_model = GaussianModel(sh_degree, ply_file_path)
-
-    cam = init_cam()
-
     splat_segmenter = SplatSegmenter(out_dir)
 
     splat_segmenter.segment_splat_image_dir()
@@ -1410,10 +1415,10 @@ def main():
     out_dir = Path("/root/code/output/gaussian_splatting/xgrids_test4/")
 
 
-    if 0:
-        vr_app_main(sh_degree, ply_file_path, out_dir)
+    if 1:
+        splat_app_main(sh_degree, ply_file_path, out_dir)
     else:
-        gaussian_segmenter_main(sh_degree, ply_file_path, out_dir)
+        gaussian_segmenter_main(out_dir)
 
 
 if __name__ == "__main__":
