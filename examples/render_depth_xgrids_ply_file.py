@@ -33,6 +33,8 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 from grounding_dino.groundingdino.util.inference import load_model, load_image, predict
 from PIL import Image
 import random
+import grounding_dino.groundingdino.datasets.transforms as T
+
 
 
 
@@ -120,6 +122,7 @@ class Recorder:
         suffix = f"_{suffix}" if suffix else ""
         self.color_dir = self.out_dir / f"color{suffix}"
         self.depth_dir = self.out_dir / f"depth{suffix}"
+        self.seg_dir = self.out_dir / f"seg{suffix}"
         self.norm_depth_dir = self.out_dir / f"norm_depth{suffix}"
         self.json_path = self.out_dir / f"poses{suffix}.json"
 
@@ -129,6 +132,7 @@ class Recorder:
 
         os.makedirs(self.color_dir, exist_ok=True)
         os.makedirs(self.depth_dir, exist_ok=True)
+        os.makedirs(self.seg_dir, exist_ok=True)
         os.makedirs(self.norm_depth_dir, exist_ok=True)
 
         print(f"🔄 Intializing recording....")
@@ -139,6 +143,7 @@ class Recorder:
         self.json_path = self.out_dir / "poses.json"
         self.color_dir = self.out_dir / "color"
         self.depth_dir = self.out_dir / "depth"
+        self.seg_dir = self.out_dir / "seg"
         self.norm_depth_dir = self.out_dir / "norm_depth"
 
         # Load JSON if it exists
@@ -161,7 +166,7 @@ class Recorder:
         print(f"🔄 Resuming recording at frame {self.frame_id}")
 
 
-    def record(self, rgb: np.ndarray, depth: np.ndarray, norm_depth: np.ndarray, pose: np.ndarray, noisy_pose: Optional[np.ndarray] = None):
+    def record(self, rgb: np.ndarray, depth: np.ndarray, norm_depth: np.ndarray, pose: np.ndarray, noisy_pose: Optional[np.ndarray] = None, seg: Optional[np.ndarray] = None):
         """
         Args:
             rgb (H x W x 3): np.uint8
@@ -178,6 +183,10 @@ class Recorder:
         cv2.imwrite(color_path, rgb)
         cv2.imwrite(depth_path, depth)
         cv2.imwrite(norm_depth_path, norm_depth)
+
+        if seg is not None:
+            seg_path = os.path.join(self.seg_dir, name)
+            cv2.imwrite(seg_path, seg)
 
         # Append metadata
         self.pose_data[self.frame_id]= pose.tolist()
@@ -519,7 +528,7 @@ class GaussianModel:
         return render_colors, render_alphas, info
 
 class SplatSegmenter:
-    def __init__(self):
+    def __init__(self, input_dir=None):
 
         """
         Hyper parameters
@@ -543,11 +552,21 @@ class SplatSegmenter:
         self.BOX_THRESHOLD = 0.35
         self.TEXT_THRESHOLD = 0.25
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.OUTPUT_DIR = Path("/root/code/output/grounded_sam2_local_demo")
 
-        # create output directory
-        self.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+        self.OUTPUT_DIR = None
+
+        # if input_dir is not None:
+        #     input_dir = "/root/code/output/xgrids_vr_test"
+
+        self.img_dir = input_dir / "color"    
+
+        if self.img_dir.exists():
+            self.OUTPUT_DIR = input_dir / "seg"
+            # create output directory
+            self.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        else:
+            assert self.img_dir.exists(), f"❌ Directory not found: {self.img_dir}"
 
 
         # build SAM2 image predictor
@@ -561,42 +580,31 @@ class SplatSegmenter:
             device=self.device
         )
 
-    def segment_splat_image_dir(self, image_dir=None):
+    def segment_splat_image_dir(self):
 
         """
         Run LangSAM segmentation on all images in a directory.
         """
 
-        image_dir = Path(image_dir)
-        image_dir = image_dir / "color"
-        assert image_dir.exists(), f"❌ Directory not found: {image_dir}"
-
-
 
         # Supported image formats
         extensions = [".jpg", ".jpeg", ".png"]
 
-        # # Loop over images
-        # for img_path in sorted(image_dir.glob("*")):
-        #     if img_path.suffix.lower() not in extensions:
-        #         continue  # skip non-image files
-
-        #     print(f"🔹 Processing: {img_path.name}")
-
-
         # list all images
-        for img_path in sorted(image_dir.iterdir()):
+        for img_path in sorted(self.img_dir.iterdir()):
             if img_path.suffix.lower() not in extensions:
                 continue  # skip non-image files
-
             print(f"🔹 Processing: {img_path}")
 
+            image_source, image = load_image(img_path)
+
             # Run LangSAM segmentation
-            self.langsam_gaussian_segmenter(img_path)
+            annotated_frame = self.langsam_gaussian_segmenter(image_source, image)
+            annotated_frame_bgr = cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR)
 
-    def langsam_gaussian_segmenter(self, img_path="/root/code/datasets/ARTGarage/segmentation_assets/artgarage_warehouse.png"):
+            cv2.imwrite(os.path.join(self.OUTPUT_DIR, img_path.name), annotated_frame_bgr)
 
-        image_source, image = load_image(img_path)
+    def langsam_gaussian_segmenter(self, image_source, image):
 
         # environment settings
         # use bfloat16
@@ -667,7 +675,6 @@ class SplatSegmenter:
         Visualize image with supervision useful API
         """
 
-        img = cv2.imread(str(img_path))
         detections = sv.Detections(
             xyxy=input_boxes,
             mask=masks.astype(bool),
@@ -682,7 +689,7 @@ class SplatSegmenter:
             colors.append(color.as_bgr())
 
         # --- Draw boxes and masks ---
-        annotated_frame = img.copy()
+        annotated_frame = image_source.copy()
 
         # Draw bounding boxes and labels
         for i, box in enumerate(detections.xyxy):
@@ -742,18 +749,17 @@ class SplatSegmenter:
         # Combine horizontally
         final_display = np.hstack([annotated_frame, legend_img])
 
-        # ============================
-        # 🖼️ Display
-        # ============================
-        cv2.namedWindow("grounded_sam2", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("grounded_sam2", 1600, 720)
-        cv2.imshow("grounded_sam2", final_display)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
+        # # ============================
+        # # 🖼️ Display
+        # # ============================
+        # cv2.namedWindow("grounded_sam2", cv2.WINDOW_NORMAL)
+        # cv2.resizeWindow("grounded_sam2", 1600, 720)
+        # cv2.imshow("grounded_sam2", final_display)
+        # cv2.waitKey(0)
+        # cv2.destroyAllWindows()
 
 
-
-
+        return final_display          
 
 class VR_APP:
     def __init__(self, cam, gaussian_model, recorder):
@@ -761,6 +767,13 @@ class VR_APP:
         self.gaussian_model = gaussian_model
         self.cam = cam
         self.recorder = recorder
+        self.splat_segmenter = SplatSegmenter(recorder.out_dir)
+        self.transform = T.Compose(
+        [
+            T.RandomResize([800], max_size=1333),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
 
         #Define noise parameters for replaying training/recorded trajectories with noise injected
         self.trans_noise=0.1
@@ -837,6 +850,12 @@ class VR_APP:
             rgb_game_img = rgb_vis_3dgs.copy()
             cv2.putText(rgb_game_img, f"Record Mode: {record_mode}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
             rgb_vis_3dgs_bgr = cv2.cvtColor(rgb_vis_3dgs, cv2.COLOR_RGB2BGR)
+
+
+            # image_pil = Image.fromarray(rgb_vis_3dgs_bgr) 
+            # image_transformed, _ = self.transform(image_pil, None)
+            # seg_img = self.splat_segmenter.langsam_gaussian_segmenter(rgb_vis_3dgs_bgr, image_transformed)
+
             depth_min = rendered_depth_3dgs.min()
             depth_max = rendered_depth_3dgs.max()
             depth_vis_3dgs = normalize_depth(rendered_depth_3dgs, depth_min, depth_max)
@@ -845,7 +864,8 @@ class VR_APP:
             pose = self.cam.T.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
             if record_mode in [Record_Mode.RECORD, Record_Mode.CONTINUE]:
-                self.recorder.record(rgb_vis_3dgs_bgr, rendered_depth_3dgs, depth_vis_3dgs, pose)
+                #self.recorder.record(rgb=rgb_vis_3dgs_bgr, depth=rendered_depth_3dgs, norm_depth=depth_vis_3dgs, pose=pose, seg=seg_img)
+                self.recorder.record(rgb=rgb_vis_3dgs_bgr, depth=rendered_depth_3dgs, norm_depth=depth_vis_3dgs, pose=pose)
 
             # === Display the output image ===
             # Convert the NumPy array to a Pygame surface
@@ -1327,34 +1347,11 @@ def init_cam():
 
     return cam
 
-def vr_app_main():
-    # parser = argparse.ArgumentParser(description="Load trained Gaussian Splat stored as a ply file and render RGBD images.")
-    # parser.add_argument("--render_video", type=bool, default=False, help="Render Video or Images")
-    # args = parser.parse_args()
-
-    # sh_degree = 3
-    # ply_file_path="/root/code/extra1/datasets/ARTGarage/xgrids/4/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply"
-
-    sh_degree = 3
-    #ply_file_path="/root/code/datasets/xgrids/LCC_output/AG_Office/ply-result/point_cloud/iteration_100/point_cloud.ply"
-    ply_file_path="/root/code/datasets/ARTGarage/lab_office_in_out_k1_scanner/output/LCC_Studio_GaussianSplat_out/AG_lab/ply-result/point_cloud/iteration_100/point_cloud.ply"
-
-    # sh_degree = 3
-    # ply_file_path="/root/code/datasets/ARTGarage/lab_office_in_out_k1_scanner/LCC_Studio_GaussianSplat_out/AG_lab/ply-result/point_cloud/iteration_100/point_cloud.ply"
-
-    #sh_degree = 0
-    #ply_file_path="/root/code/datasets/xgrids/LCC_output/portal_cam_output_LCC/output/ply-result/point_cloud/iteration_100/point_cloud_1.ply"
-
+def vr_app_main(sh_degree, ply_file_path, out_dir):
     
     gaussian_model = GaussianModel(sh_degree, ply_file_path)
 
-    # render_xgrids_pose_file(gaussian_model, render_video=True)
-
-    # vr_walkthrough_opencv(gaussian_model)
-    # vr_walkthrough_pygame(gaussian_model)
-
     cam = init_cam()
-    out_dir = Path("/root/code/output/gaussian_splatting/xgrids_test1/")
     
     #record_mode = Record_Mode.CONTINUE
     record_mode = Record_Mode.PAUSE
@@ -1385,10 +1382,17 @@ def vr_app_main():
     # vr_app.replay_with_noise(training_pose_file)
 
 
-def gaussian_segmenter_main():
-    # parser = argparse.ArgumentParser(description="Load trained Gaussian Splat stored as a ply file and render RGBD images.")
-    # parser.add_argument("--render_video", type=bool, default=False, help="Render Video or Images")
-    # args = parser.parse_args()
+def gaussian_segmenter_main(sh_degree, ply_file_path, out_dir):
+    
+    gaussian_model = GaussianModel(sh_degree, ply_file_path)
+
+    cam = init_cam()
+
+    splat_segmenter = SplatSegmenter(out_dir)
+
+    splat_segmenter.segment_splat_image_dir()
+
+def main():
 
     # sh_degree = 3
     # ply_file_path="/root/code/extra1/datasets/ARTGarage/xgrids/4/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply"
@@ -1403,34 +1407,13 @@ def gaussian_segmenter_main():
     #sh_degree = 0
     #ply_file_path="/root/code/datasets/xgrids/LCC_output/portal_cam_output_LCC/output/ply-result/point_cloud/iteration_100/point_cloud_1.ply"
 
-    
-    gaussian_model = GaussianModel(sh_degree, ply_file_path)
-
-    cam = init_cam()
-    out_dir = Path("/root/code/output/gaussian_splatting/xgrids_test1/")
+    out_dir = Path("/root/code/output/gaussian_splatting/xgrids_test4/")
 
 
-    #record_mode = Record_Mode.CONTINUE
-    record_mode = Record_Mode.PAUSE
-
-    recorder = Recorder(out_dir, record_mode)
-    
-    vr_app = VR_APP(cam, gaussian_model, recorder)
-
-
-    # # First interactively record trajectory
-    # vr_app.vr_walkthrough_pygame(record_mode)
-
-    splat_segmenter = SplatSegmenter()
-
-
-    splat_segmenter.segment_splat_image_dir(out_dir)
-
-def main():
-    #vr_app_main()
-
-    gaussian_segmenter_main()
-    print("Running Splat Segmenter....")
+    if 0:
+        vr_app_main(sh_degree, ply_file_path, out_dir)
+    else:
+        gaussian_segmenter_main(sh_degree, ply_file_path, out_dir)
 
 
 if __name__ == "__main__":
