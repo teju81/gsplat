@@ -527,13 +527,67 @@ class GaussianModel:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
 
+
+class CLIPFeatureExtractor:
+    def __init__(self, prompts=None):
+
+        if prompts is not None:
+            self.prompts = prompts
+        else:
+            self.prompts = ["floor", "wall", "pillars", "others"]
+
+
+        self.generate_embeddings() # Generate Clip Embeddings for defined object classes
+
+
+        # Initialize CLIP model and processor
+        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to("cuda")
+        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+        # Compute the "others" embedding
+        self.others_embedding = self._get_others_embedding()
+
+    def generate_embeddings(self):
+        # Compute the "others" embedding only once
+        self.embeddings = {}
+        for prompt in self.prompts:
+            inputs = self.clip_processor(text=prompt, return_tensors="pt", padding=True).to("cuda")
+            text_feat = self.clip_model.get_text_features(**inputs)  # Shape: [1, 512] (embedding for "others")
+            norm_embedding = torch.nn.functional.normalize(text_feat, p=2, dim=1)
+            self.embeddings[prompt] = norm_embedding.detach().cpu().numpy() # Detach the tensor and convert it to a NumPy array    
+        return
+
+    def generate_feature_map(self, image, masks):
+        if masks.is_cuda:
+            masks = masks.cpu()
+
+        # Use the precomputed "others" embedding
+        others_embedding = self.embeddings["others"]
+
+        # Get the shape of the image
+        H, W, _ = np.array(image).shape
+        
+        # Initialize the feature map with the "others" embedding
+        feature_map = others_embedding.repeat(H * W, axis=0).reshape(H, W, 512)
+
+        # Apply the class-specific embeddings for each mask
+        for i, mask in enumerate(masks):
+            class_idx = class_indices[i]
+            if class_idx >= len(classes) or classes[class_idx] == "N/A":
+                continue
+            class_vector = self.embeddings[classes[class_idx]]
+            feature_map[mask > 0] = class_vector
+
+        return feature_map
+
+
 class SplatSegmenter:
     def __init__(self, input_dir=None):
 
         """
         Hyper parameters
         """
-        self.text = "floor. wall. plants. door. window. fan. chair. machine. fire extinguisher. shoe rack. traffic cone. chain."
+        self.text = "floor. wall. pillars. plants. door. window. fan. chair. machine. fire extinguisher. shoe rack. traffic cone. chain."
 
         self.class_names = [cls.strip().rstrip('.') for cls in self.text.split('.') if cls.strip()]
 
@@ -828,6 +882,59 @@ class SPLAT_APP:
         seg_img = None
 
         return rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs, seg_img
+
+
+    def transfer_features_to_splat(self):
+
+
+        ## Step 1: Initialization
+
+
+        # init Yolo model
+
+        # init SAM segmentor
+
+        # init ClipFeatureExtractor
+
+        # copy Gaussian parameters
+
+        # Copy camera intrinsics used in splat
+
+        ## Step 2: Iterate over all camera images
+
+        # read pose of image
+        # Rasterize image from splat
+        # Retrieve bounding boxes
+        # Generate binary masks for BBs using SAM
+
+        # FOR each mask: Generate a clip feature map
+        # initialize feature map with others embedding - (size of feature map : H X W X D)
+        # Find feature embedding for class to which mask corresponds
+        # Copy feature embedding to all pixels where mask is non-zero
+
+        # feats = torch.nn.functional.normalize(torch.tensor(clip_feature_map, device = dev), dim=-1)
+        # Compress feature map if encoder decoder is available
+
+        # Backproject features onto gaussians : rasterize 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def vr_walkthrough_pygame(self, record_mode):
 
