@@ -989,6 +989,9 @@ class SPLAT_APP:
 
                 # === Rasterize for gradient flow ===
                 colors_feats = torch.zeros((self.gaussian_model._xyz.shape[0], embed_dim), device=device, requires_grad=True)
+                colors_feats_0 = torch.zeros(self.gaussian_model._xyz.shape[0], 3, device=device, requires_grad=True)
+
+                # 1️⃣ Numerator rasterization
 
                 output_for_grad, _, _ = rasterization(
                     means=self.gaussian_model._xyz,
@@ -997,17 +1000,40 @@ class SPLAT_APP:
                     opacities=torch.sigmoid(self.gaussian_model._opacity),
                     colors=colors_feats.unsqueeze(1),  # match API shape [N, K, D]
                     viewmats=viewmat,
-                    Ks=self.gaussian_model.cam_matrix if hasattr(self.gaussian_model, "cam_matrix") else torch.eye(3, device=device).unsqueeze(0),
+                    Ks=self.cam.Ks,
                     width=W,
                     height=H,
                 )
 
-                target = (output_for_grad[0] * feats).sum()
-                target.backward()
+                target_feat = (output_for_grad[0] * feats).sum()
+                target_feat.backward()
 
-                gaussian_features += colors_feats.grad
-                gaussian_denoms += 1
+                gaussian_features += colors_feats.grad.clone()
                 colors_feats.grad.zero_()
+
+                # 2️⃣ Denominator rasterization
+                output_denom, _, _ = rasterization(
+                    means=self.gaussian_model._xyz,
+                    quats=self.gaussian_model._rotation,
+                    scales=torch.exp(self.gaussian_model._scaling),
+                    opacities=torch.sigmoid(self.gaussian_model._opacity),
+                    colors=colors_feats_0.unsqueeze(1),  # match API shape [N, K, D]
+                    viewmats=viewmat,
+                    Ks=self.cam.Ks,
+                    width=W,
+                    height=H,
+                )
+
+                target_denom = (output_denom[0]).sum()   # just sum all contributions
+                target_denom.backward()
+
+                gaussian_denoms += colors_feats_0.grad[:, 0]
+                colors_feats_0.grad.zero_()
+
+                # Clear unused variables and caches
+                del viewmat, feats, output_for_grad, output_denom, target_feat, target_denom
+                torch.cuda.empty_cache()
+                #torch.cuda.synchronize()
 
             gaussian_features = gaussian_features / gaussian_denoms[..., None]
             gaussian_features = torch.nn.functional.normalize(gaussian_features, dim=-1)
@@ -1017,48 +1043,6 @@ class SPLAT_APP:
             self.gaussian_model._feature_field = gaussian_features
 
             return 
-
-
-
-
-    # def transfer_features_to_splat(self):
-
-
-    #     ## Step 1: Initialization
-
-
-    #     # init Yolo model
-
-    #     # init SAM segmentor
-
-    #     # init ClipFeatureExtractor
-
-    #     # copy Gaussian parameters
-
-    #     # Copy camera intrinsics used in splat
-
-    #     ## Step 2: Iterate over all camera images
-
-    #     # read pose of image
-    #     # Rasterize image from splat
-    #     # Retrieve bounding boxes
-    #     # Generate binary masks for BBs using SAM
-
-    #     # FOR each mask: Generate a clip feature map
-    #     # initialize feature map with others embedding - (size of feature map : H X W X D)
-    #     # Find feature embedding for class to which mask corresponds
-    #     # Copy feature embedding to all pixels where mask is non-zero
-
-    #     # feats = torch.nn.functional.normalize(torch.tensor(clip_feature_map, device = dev), dim=-1)
-    #     # Compress feature map if encoder decoder is available
-
-    #     # Backproject features onto gaussians : rasterize 
-
-    #     pass
-
-
-
-
 
 
     def vr_walkthrough_pygame(self, record_mode):
