@@ -616,6 +616,7 @@ class SplatSegmenter:
 
             # Run LangSAM segmentation
             annotated_frame_bgr, feature_map_norm = self.langsam_gaussian_segmenter(image_source, image)
+            print(f"Memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 
             if record_mode:
                 cv2.imwrite(os.path.join(self.OUTPUT_DIR, img_path.name), annotated_frame_bgr)
@@ -631,6 +632,8 @@ class SplatSegmenter:
 
             del image_source, image, annotated_frame_bgr, feature_map_norm
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
 
     def langsam_gaussian_segmenter(self, image_source, image):
 
@@ -647,7 +650,7 @@ class SplatSegmenter:
 
         self.sam2_predictor.set_image(image_source)
 
-        with torch.autocast(device_type=self.device, dtype=torch.float32):
+        with torch.inference_mode(), torch.autocast(device_type=self.device, dtype=torch.float16):
             boxes, gdino_detection_confidences, gdino_detection_labels = predict(
                 model=self.grounding_model,
                 image=image,
@@ -673,7 +676,7 @@ class SplatSegmenter:
         else:
             autocast_dtype = torch.float32
 
-        with torch.autocast(device_type=self.device, dtype=autocast_dtype):
+        with torch.inference_mode(), torch.autocast(device_type=self.device, dtype=autocast_dtype):
             masks, scores, logits = self.sam2_predictor.predict(
                 point_coords=None,
                 point_labels=None,
@@ -769,7 +772,7 @@ class SplatSegmenter:
             class_vector = self.embeddings[class_name]
             feature_map[mask > 0] = class_vector
             #print(f"gdino_class_name: {class_name}, feature_map: {feature_map[mask > 0].shape} feature_vec: {class_vector.shape}")
-        feature_map_norm = torch.nn.functional.normalize(torch.tensor(feature_map, device = "cuda"), dim=-1)
+        feature_map = torch.nn.functional.normalize(torch.tensor(feature_map, device = "cuda"), dim=-1)
                 
         # # for 512->16 
         # if compress:
@@ -828,8 +831,10 @@ class SplatSegmenter:
         #     cv2.waitKey(0)
         #     cv2.destroyAllWindows()
 
+        self.sam2_predictor.reset_image()
 
-        return final_display_bgr, feature_map_norm          
+
+        return final_display_bgr, feature_map          
 
     def generate_embeddings(self):
         # Compute the "others" embedding only once
