@@ -34,6 +34,7 @@ from grounding_dino.groundingdino.util.inference import load_model, load_image, 
 from PIL import Image
 import random
 import grounding_dino.groundingdino.datasets.transforms as T
+from transformers import CLIPProcessor, CLIPModel
 
 
 
@@ -386,6 +387,7 @@ class GaussianModel:
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
+        self._feature_field = torch.empty(0) # Semantic feature field
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
@@ -537,48 +539,6 @@ class CLIPFeatureExtractor:
             self.prompts = ["floor", "wall", "pillars", "others"]
 
 
-        self.generate_embeddings() # Generate Clip Embeddings for defined object classes
-
-
-        # Initialize CLIP model and processor
-        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to("cuda")
-        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-
-        # Compute the "others" embedding
-        self.others_embedding = self._get_others_embedding()
-
-    def generate_embeddings(self):
-        # Compute the "others" embedding only once
-        self.embeddings = {}
-        for prompt in self.prompts:
-            inputs = self.clip_processor(text=prompt, return_tensors="pt", padding=True).to("cuda")
-            text_feat = self.clip_model.get_text_features(**inputs)  # Shape: [1, 512] (embedding for "others")
-            norm_embedding = torch.nn.functional.normalize(text_feat, p=2, dim=1)
-            self.embeddings[prompt] = norm_embedding.detach().cpu().numpy() # Detach the tensor and convert it to a NumPy array    
-        return
-
-    def generate_feature_map(self, image, masks):
-        if masks.is_cuda:
-            masks = masks.cpu()
-
-        # Use the precomputed "others" embedding
-        others_embedding = self.embeddings["others"]
-
-        # Get the shape of the image
-        H, W, _ = np.array(image).shape
-        
-        # Initialize the feature map with the "others" embedding
-        feature_map = others_embedding.repeat(H * W, axis=0).reshape(H, W, 512)
-
-        # Apply the class-specific embeddings for each mask
-        for i, mask in enumerate(masks):
-            class_idx = class_indices[i]
-            if class_idx >= len(classes) or classes[class_idx] == "N/A":
-                continue
-            class_vector = self.embeddings[classes[class_idx]]
-            feature_map[mask > 0] = class_vector
-
-        return feature_map
 
 
 class SplatSegmenter:
@@ -587,9 +547,18 @@ class SplatSegmenter:
         """
         Hyper parameters
         """
-        self.text = "floor. wall. pillars. plants. door. window. fan. chair. machine. fire extinguisher. shoe rack. traffic cone. chain."
+        #self.text = "floor. wall. pillars. plants. door. window. fan. chair. machine. fire extinguisher. shoe rack. traffic cone. chain."
+        self.text = "floor. wall. pillars."
 
         self.class_names = [cls.strip().rstrip('.') for cls in self.text.split('.') if cls.strip()]
+        self.clip_embedding_classes = self.class_names + ["others"]
+
+        # Initialize CLIP model and processor
+        self.clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to("cuda")
+        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+        self.generate_embeddings() # Generate Clip Embeddings for defined object classes
+    
 
         # === Create consistent color map across runs ===
         random.seed(42)  # ensure same colors every run
@@ -609,6 +578,7 @@ class SplatSegmenter:
 
 
         self.OUTPUT_DIR = None
+        self.FEATURE_DIR = None
 
         # if input_dir is not None:
         #     input_dir = "/root/code/output/xgrids_vr_test"
@@ -619,6 +589,9 @@ class SplatSegmenter:
             self.OUTPUT_DIR = input_dir / "seg"
             # create output directory
             self.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+            self.FEATURE_DIR = input_dir / "features"
+            self.FEATURE_DIR.mkdir(parents=True, exist_ok=True)
         else:
             assert self.img_dir.exists(), f"❌ Directory not found: {self.img_dir}"
 
@@ -634,7 +607,7 @@ class SplatSegmenter:
             device=self.device
         )
 
-    def segment_splat_image_dir(self):
+    def segment_splat_image_dir(self, record_mode=True):
 
         """
         Run LangSAM segmentation on all images in a directory.
@@ -653,10 +626,19 @@ class SplatSegmenter:
             image_source, image = load_image(img_path)
 
             # Run LangSAM segmentation
-            annotated_frame = self.langsam_gaussian_segmenter(image_source, image)
-            annotated_frame_bgr = cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR)
+            annotated_frame_bgr, feature_map_norm = self.langsam_gaussian_segmenter(image_source, image)
 
-            cv2.imwrite(os.path.join(self.OUTPUT_DIR, img_path.name), annotated_frame_bgr)
+            if record_mode:
+                cv2.imwrite(os.path.join(self.OUTPUT_DIR, img_path.name), annotated_frame_bgr)
+
+                # ✅ Save feature map as .pt (PyTorch tensor)
+                feature_save_path = self.FEATURE_DIR / (img_path.stem + ".pt")
+                torch.save(feature_map_norm, feature_save_path)
+                print(f"💾 Saved feature map: {feature_save_path}")
+
+                # # ✅ Save feature map as .npy (numpy)
+                # np.save(self.FEATURE_DIR / (img_path.stem + ".npy"), feature_map_norm.cpu().numpy())
+
 
     def langsam_gaussian_segmenter(self, image_source, image):
 
@@ -674,7 +656,7 @@ class SplatSegmenter:
         self.sam2_predictor.set_image(image_source)
 
         with torch.autocast(device_type=self.device, dtype=torch.float32):
-            boxes, confidences, labels = predict(
+            boxes, gdino_detection_confidences, gdino_detection_labels = predict(
                 model=self.grounding_model,
                 image=image,
                 caption=self.text,
@@ -714,16 +696,16 @@ class SplatSegmenter:
         if masks.ndim == 4:
             masks = masks.squeeze(1)
 
-        confidences = confidences.numpy().tolist()
-        class_names = labels
+        gdino_detection_confidences = gdino_detection_confidences.numpy().tolist()
 
-        class_ids = np.array(list(range(len(class_names))))
+        class_ids = np.array(list(range(len(gdino_detection_labels))))
 
         labels = [
             f"{class_name} {confidence:.2f}"
             for class_name, confidence
-            in zip(class_names, confidences)
+            in zip(gdino_detection_labels, gdino_detection_confidences)
         ]
+        #print(labels)
 
         """
         Visualize image with supervision useful API
@@ -738,7 +720,7 @@ class SplatSegmenter:
         # --- Compute per-detection colors manually ---
         colors = []
         for class_id in detections.class_id:
-            cls = class_names[int(class_id)] if class_id < len(class_names) else "unknown"
+            cls = gdino_detection_labels[int(class_id)] if class_id < len(gdino_detection_labels) else "unknown"
             color = self.CLASS_COLOR_MAP.get(cls, sv.Color(255, 255, 255))
             colors.append(color.as_bgr())
 
@@ -763,6 +745,45 @@ class SplatSegmenter:
             colored_mask = np.zeros_like(annotated_frame)
             colored_mask[mask] = color
             annotated_frame = cv2.addWeighted(annotated_frame, 1.0, colored_mask, 0.4, 0)
+
+        # Generate Feature map
+
+        # Use the precomputed "others" embedding
+        others_embedding = self.embeddings["others"]
+
+        # Get the shape of the image
+        H, W, _ = image_source.shape
+        
+        # Initialize the feature map with the "others" embedding
+        feature_map = others_embedding.repeat(H * W, axis=0).reshape(H, W, 512)
+
+        # Apply the class-specific embeddings for each mask
+        DISPLAY_FLAG = False
+        for i, mask in enumerate(detections.mask):
+            class_name = gdino_detection_labels[i]
+
+            # GDINO can generate labels that are not in the classes defined (limited testing results show a bounding box generated can have multiple labels)
+            # (label generated is just a string with detected class labels appended to each other seperated with spaces)
+            # Some more observations - GDINO can produce multiple bounding boxes for the same object (again limited testing)
+            # example plants in concrete pots produce bboxes for plants and plants plus the pots, but SAM segments only plants for both bounding boxes
+            # Another example is fans, here SAM is making mistakes sometimes
+            # Extensive testing required. Similar images are generating different results sometimes..
+
+
+            if class_name not in self.class_names:
+                DISPLAY_FLAG = True
+                #print(f"Detected class label {class_name} not in classes defined.... Not processing mask!!!")
+                continue
+            class_vector = self.embeddings[class_name]
+            feature_map[mask > 0] = class_vector
+            #print(f"gdino_class_name: {class_name}, feature_map: {feature_map[mask > 0].shape} feature_vec: {class_vector.shape}")
+        feature_map_norm = torch.nn.functional.normalize(torch.tensor(feature_map, device = "cuda"), dim=-1)
+                
+        # # for 512->16 
+        # if compress:
+        #     feature_map_norm = feature_map_norm @ encoder_decoder.encoder
+
+
 
         # ============================
         # 🟦 ADD VISUAL LEGEND ON RIGHT
@@ -802,18 +823,61 @@ class SplatSegmenter:
 
         # Combine horizontally
         final_display = np.hstack([annotated_frame, legend_img])
+        final_display_bgr = cv2.cvtColor(final_display, cv2.COLOR_RGB2BGR)
+
 
         # # ============================
         # # 🖼️ Display
         # # ============================
-        # cv2.namedWindow("grounded_sam2", cv2.WINDOW_NORMAL)
-        # cv2.resizeWindow("grounded_sam2", 1600, 720)
-        # cv2.imshow("grounded_sam2", final_display)
-        # cv2.waitKey(0)
-        # cv2.destroyAllWindows()
+        # if DISPLAY_FLAG:
+        #     cv2.namedWindow("grounded_sam2", cv2.WINDOW_NORMAL)
+        #     cv2.resizeWindow("grounded_sam2", 1600, 720)
+        #     cv2.imshow("grounded_sam2", final_display_bgr)
+        #     cv2.waitKey(0)
+        #     cv2.destroyAllWindows()
 
 
-        return final_display          
+        return final_display_bgr, feature_map_norm          
+
+    def generate_embeddings(self):
+        # Compute the "others" embedding only once
+        self.embeddings = {}
+        for prompt in self.clip_embedding_classes:
+            inputs = self.clip_processor(text=prompt, return_tensors="pt", padding=True).to("cuda")
+            text_feat = self.clip_model.get_text_features(**inputs)  # Shape: [1, 512] (embedding for "others")
+            norm_embedding = torch.nn.functional.normalize(text_feat, p=2, dim=1)
+            self.embeddings[prompt] = norm_embedding.detach().cpu().numpy() # Detach the tensor and convert it to a NumPy array    
+
+
+        for key, embedding in self.embeddings.items():
+            print(f"Class: {key}, Embedding Shape: {embedding.shape}")
+        return
+
+    def generate_feature_map(self, image, detections):
+
+        masks = detections.masks
+
+        if masks.is_cuda:
+            masks = masks.cpu()
+
+        # Use the precomputed "others" embedding
+        others_embedding = self.embeddings["others"]
+
+        # Get the shape of the image
+        H, W, _ = image.shape
+        
+        # Initialize the feature map with the "others" embedding
+        feature_map = others_embedding.repeat(H * W, axis=0).reshape(H, W, 512)
+
+        # Apply the class-specific embeddings for each mask
+        for i, mask in enumerate(masks):
+            class_idx = detections.class_id[i]
+            # if class_idx >= len(classes) or classes[class_idx] == "N/A":
+            #     continue
+            class_vector = self.embeddings[classes[class_idx]]
+            feature_map[mask > 0] = class_vector
+
+        return feature_map
 
 class SPLAT_APP:
     def __init__(self, cam, gaussian_model, recorder):
@@ -822,6 +886,7 @@ class SPLAT_APP:
         self.cam = cam
         self.recorder = recorder
         self.splat_segmenter = SplatSegmenter(recorder.out_dir)
+        self.clip_feature_extractor = CLIPFeatureExtractor()
         self.transform = T.Compose(
         [
             T.RandomResize([800], max_size=1333),
@@ -884,52 +949,112 @@ class SPLAT_APP:
         return rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs, seg_img
 
 
-    def transfer_features_to_splat(self):
+        def transfer_saved_features_to_splat(self, input_dir):
+            """
+            Args:
+                input_dir: Directory from which to parse images, poses and features
+            Returns:
+                gaussian_features: [N, D] per-Gaussian semantic embedding
+            """
 
 
-        ## Step 1: Initialization
+            # === Read poses from JSON ===
+            json_path = input_dir / "poses.json"
+
+            device = "cuda"
+            embed_dim = 512
+
+            # === Read poses from JSON ===
+            with open(json_path, "r") as f:
+                data = json.load(f)
+            pose_data = data["poses"]
+
+            gaussian_features = torch.zeros((self.gaussian_model._xyz.shape[0], embed_dim), device=device)
+            gaussian_denoms = torch.ones((self.gaussian_model._xyz.shape[0]), device=device) * 1e-12
+
+            # === Iterate over all frames ===
+            for frame_id_str, pose_list in pose_data.items():
+                frame_id = int(frame_id_str)
+                feat_path = feature_dir / f"frame_{frame_id:04d}.pt"
+                if not feat_path.exists():
+                    print(f"⚠️ Missing feature map: {feat_path}")
+                    continue
+
+                feats = torch.load(feat_path).to(device)  # [H, W, D]
+                H, W, _ = feats.shape
+
+                # === Convert JSON pose to torch tensor ===
+                pose = torch.tensor(pose_list, dtype=torch.float32, device=device)  # [4,4]
+                viewmat = torch.linalg.inv(pose.unsqueeze(0))  # camera-to-world → world-to-camera
+
+                # === Rasterize for gradient flow ===
+                colors_feats = torch.zeros((self.gaussian_model._xyz.shape[0], embed_dim), device=device, requires_grad=True)
+
+                output_for_grad, _, _ = rasterization(
+                    means=self.gaussian_model._xyz,
+                    quats=self.gaussian_model._rotation,
+                    scales=torch.exp(self.gaussian_model._scaling),
+                    opacities=torch.sigmoid(self.gaussian_model._opacity),
+                    colors=colors_feats.unsqueeze(1),  # match API shape [N, K, D]
+                    viewmats=viewmat,
+                    Ks=self.gaussian_model.cam_matrix if hasattr(self.gaussian_model, "cam_matrix") else torch.eye(3, device=device).unsqueeze(0),
+                    width=W,
+                    height=H,
+                )
+
+                target = (output_for_grad[0] * feats).sum()
+                target.backward()
+
+                gaussian_features += colors_feats.grad
+                gaussian_denoms += 1
+                colors_feats.grad.zero_()
+
+            gaussian_features = gaussian_features / gaussian_denoms[..., None]
+            gaussian_features = torch.nn.functional.normalize(gaussian_features, dim=-1)
+            gaussian_features[torch.isnan(gaussian_features)] = 0
+            print("✅ Computed per-Gaussian semantic features.")
+            
+            self.gaussian_model._feature_field = gaussian_features
+
+            return 
 
 
-        # init Yolo model
-
-        # init SAM segmentor
-
-        # init ClipFeatureExtractor
-
-        # copy Gaussian parameters
-
-        # Copy camera intrinsics used in splat
-
-        ## Step 2: Iterate over all camera images
-
-        # read pose of image
-        # Rasterize image from splat
-        # Retrieve bounding boxes
-        # Generate binary masks for BBs using SAM
-
-        # FOR each mask: Generate a clip feature map
-        # initialize feature map with others embedding - (size of feature map : H X W X D)
-        # Find feature embedding for class to which mask corresponds
-        # Copy feature embedding to all pixels where mask is non-zero
-
-        # feats = torch.nn.functional.normalize(torch.tensor(clip_feature_map, device = dev), dim=-1)
-        # Compress feature map if encoder decoder is available
-
-        # Backproject features onto gaussians : rasterize 
 
 
+    # def transfer_features_to_splat(self):
 
 
+    #     ## Step 1: Initialization
 
 
+    #     # init Yolo model
 
+    #     # init SAM segmentor
 
+    #     # init ClipFeatureExtractor
 
+    #     # copy Gaussian parameters
 
+    #     # Copy camera intrinsics used in splat
 
+    #     ## Step 2: Iterate over all camera images
 
+    #     # read pose of image
+    #     # Rasterize image from splat
+    #     # Retrieve bounding boxes
+    #     # Generate binary masks for BBs using SAM
 
+    #     # FOR each mask: Generate a clip feature map
+    #     # initialize feature map with others embedding - (size of feature map : H X W X D)
+    #     # Find feature embedding for class to which mask corresponds
+    #     # Copy feature embedding to all pixels where mask is non-zero
 
+    #     # feats = torch.nn.functional.normalize(torch.tensor(clip_feature_map, device = dev), dim=-1)
+    #     # Compress feature map if encoder decoder is available
+
+    #     # Backproject features onto gaussians : rasterize 
+
+    #     pass
 
 
 
@@ -1498,11 +1623,26 @@ def splat_app_main(sh_degree, ply_file_path, out_dir):
     # splat_app.replay_with_noise(training_pose_file)
 
 
-def gaussian_segmenter_main(out_dir):
+def calculate_gaussian_feature_field_main(sh_degree, ply_file_path, out_dir):
+
+
+    gaussian_model = GaussianModel(sh_degree, ply_file_path)
+
+    cam = init_cam()
     
+    #record_mode = Record_Mode.CONTINUE
+    record_mode = Record_Mode.PAUSE
+
+    recorder = Recorder(out_dir, record_mode)
+    
+    splat_app = SPLAT_APP(cam, gaussian_model, recorder)
+
     splat_segmenter = SplatSegmenter(out_dir)
 
-    splat_segmenter.segment_splat_image_dir()
+    splat_segmenter.segment_splat_image_dir(record_mode=True)
+
+    splat_app.transfer_saved_features_to_splat(out_dir)
+
 
 def main():
 
@@ -1522,10 +1662,10 @@ def main():
     out_dir = Path("/root/code/output/gaussian_splatting/xgrids_test4/")
 
 
-    if 1:
+    if 0:
         splat_app_main(sh_degree, ply_file_path, out_dir)
     else:
-        gaussian_segmenter_main(out_dir)
+        calculate_gaussian_feature_field_main(sh_degree, ply_file_path, out_dir)
 
 
 if __name__ == "__main__":
