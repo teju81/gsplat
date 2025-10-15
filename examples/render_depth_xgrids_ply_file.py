@@ -35,7 +35,7 @@ from PIL import Image
 import random
 import grounding_dino.groundingdino.datasets.transforms as T
 from transformers import CLIPProcessor, CLIPModel
-
+import gc
 
 
 
@@ -631,6 +631,7 @@ class SplatSegmenter:
                 # Clear unused variables and caches
 
             del image_source, image, annotated_frame_bgr, feature_map_norm
+            gc.collect()
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
@@ -831,10 +832,7 @@ class SplatSegmenter:
         #     cv2.waitKey(0)
         #     cv2.destroyAllWindows()
 
-        self.sam2_predictor.reset_image()
-
-
-        return final_display_bgr, feature_map          
+        return final_display_bgr, feature_map
 
     def generate_embeddings(self):
         # Compute the "others" embedding only once
@@ -849,32 +847,6 @@ class SplatSegmenter:
         for key, embedding in self.embeddings.items():
             print(f"Class: {key}, Embedding Shape: {embedding.shape}")
         return
-
-    def generate_feature_map(self, image, detections):
-
-        masks = detections.masks
-
-        if masks.is_cuda:
-            masks = masks.cpu()
-
-        # Use the precomputed "others" embedding
-        others_embedding = self.embeddings["others"]
-
-        # Get the shape of the image
-        H, W, _ = image.shape
-        
-        # Initialize the feature map with the "others" embedding
-        feature_map = others_embedding.repeat(H * W, axis=0).reshape(H, W, 512)
-
-        # Apply the class-specific embeddings for each mask
-        for i, mask in enumerate(masks):
-            class_idx = detections.class_id[i]
-            # if class_idx >= len(classes) or classes[class_idx] == "N/A":
-            #     continue
-            class_vector = self.embeddings[classes[class_idx]]
-            feature_map[mask > 0] = class_vector
-
-        return feature_map
 
 class SPLAT_APP:
     def __init__(self, cam, gaussian_model, recorder):
