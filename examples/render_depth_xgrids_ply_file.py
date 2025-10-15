@@ -36,7 +36,9 @@ import random
 import grounding_dino.groundingdino.datasets.transforms as T
 from transformers import CLIPProcessor, CLIPModel
 import gc
-
+import glob
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 
 
 def inverse_sigmoid(x):
@@ -529,6 +531,61 @@ class GaussianModel:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
 
+# ------------------------------
+# Dataset: samples random pixels from saved feature maps
+# ------------------------------
+
+class CLIPFeatureDataset(Dataset):
+    def __init__(self, feature_dir, sample_size=100_000):
+        self.files = sorted(glob.glob(os.path.join(feature_dir, "*.pt")))
+        assert len(self.files) > 0, f"No .pt files found in {feature_dir}"
+        self.sample_size = sample_size
+
+        print(f"📁 Found {len(self.files)} feature maps in {feature_dir}")
+        print(f"🎯 Sampling total {sample_size:,} random feature vectors")
+
+        self.samples = []
+        per_file = max(1, sample_size // len(self.files))
+
+        for f in tqdm(self.files, desc="Loading feature maps"):
+            feat = torch.load(f, map_location="cpu")  # [H, W, 512]
+            feat = feat.view(-1, 512)
+            n = min(per_file, feat.shape[0])
+            idx = torch.randperm(feat.shape[0])[:n]
+            self.samples.append(feat[idx])
+
+        self.samples = torch.cat(self.samples, dim=0)
+        print(f"✅ Loaded {self.samples.shape[0]:,} samples total")
+
+    def __len__(self):
+        return self.samples.shape[0]
+
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+
+# ------------------------------
+# Model: simple fully-connected autoencoder
+# ------------------------------
+
+class CLIPAutoencoder(nn.Module):
+    def __init__(self, input_dim=512, latent_dim=32):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, latent_dim)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, input_dim)
+        )
+
+    def forward(self, x):
+        z = self.encoder(x)
+        x_rec = self.decoder(z)
+        return x_rec, z
 
 class SplatSegmenter:
     def __init__(self, input_dir=None):
@@ -607,7 +664,9 @@ class SplatSegmenter:
         extensions = [".jpg", ".jpeg", ".png"]
 
         # list all images
-        for img_path in sorted(self.img_dir.iterdir()):
+        for frame_id, img_path in enumerate(sorted(self.img_dir.iterdir())):
+            if frame_id > 20:
+                break
             if img_path.suffix.lower() not in extensions:
                 continue  # skip non-image files
             print(f"🔹 Processing: {img_path}")
@@ -917,101 +976,114 @@ class SPLAT_APP:
         return rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs, seg_img
 
 
-        def transfer_saved_features_to_splat(self, input_dir):
-            """
-            Args:
-                input_dir: Directory from which to parse images, poses and features
-            Returns:
-                gaussian_features: [N, D] per-Gaussian semantic embedding
-            """
+    def transfer_saved_features_to_splat(self, input_dir):
+        """
+        Args:
+            input_dir: Directory from which to parse images, poses and features
+        Returns:
+            gaussian_features: [N, D] per-Gaussian semantic embedding
+        """
 
 
-            # === Read poses from JSON ===
-            json_path = input_dir / "poses.json"
+        # === Read poses from JSON ===
+        json_path = input_dir / "poses.json"
 
-            device = "cuda"
-            embed_dim = 512
+        device = "cuda"
+        embed_dim = 32
 
-            # === Read poses from JSON ===
-            with open(json_path, "r") as f:
-                data = json.load(f)
-            pose_data = data["poses"]
+        # === Read poses from JSON ===
+        with open(json_path, "r") as f:
+            data = json.load(f)
+        pose_data = data["poses"]
 
-            gaussian_features = torch.zeros((self.gaussian_model._xyz.shape[0], embed_dim), device=device)
-            gaussian_denoms = torch.ones((self.gaussian_model._xyz.shape[0]), device=device) * 1e-12
+        gaussian_features = torch.zeros((self.gaussian_model._xyz.shape[0], embed_dim), device=device)
+        gaussian_denoms = torch.ones((self.gaussian_model._xyz.shape[0]), device=device) * 1e-12
+        del self.splat_segmenter, data
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        print(f"Memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 
-            # === Iterate over all frames ===
-            for frame_id_str, pose_list in pose_data.items():
-                frame_id = int(frame_id_str)
-                feat_path = feature_dir / f"frame_{frame_id:04d}.pt"
-                if not feat_path.exists():
-                    print(f"⚠️ Missing feature map: {feat_path}")
-                    continue
+        # === Iterate over all frames ===
+        for frame_id_str, pose_list in pose_data.items():
+            frame_id = int(frame_id_str)
+            if frame_id > 20:
+                break
+            feat_path = input_dir / "features" / "latent_32d" / f"frame_{frame_id:04d}.pt"
+            if not feat_path.exists():
+                print(f"⚠️ Missing feature map: {feat_path}")
+                continue
 
-                feats = torch.load(feat_path).to(device)  # [H, W, D]
-                H, W, _ = feats.shape
+            feats = torch.load(feat_path).to(device)  # [H, W, D]
+            H, W, _ = feats.shape
 
-                # === Convert JSON pose to torch tensor ===
-                pose = torch.tensor(pose_list, dtype=torch.float32, device=device)  # [4,4]
-                viewmat = torch.linalg.inv(pose.unsqueeze(0))  # camera-to-world → world-to-camera
+            # === Convert JSON pose to torch tensor ===
+            pose = torch.tensor(pose_list, dtype=torch.float32, device=device)  # [4,4]
+            viewmat = torch.linalg.inv(pose.unsqueeze(0))  # camera-to-world → world-to-camera
 
-                # === Rasterize for gradient flow ===
-                colors_feats = torch.zeros((self.gaussian_model._xyz.shape[0], embed_dim), device=device, requires_grad=True)
-                colors_feats_0 = torch.zeros(self.gaussian_model._xyz.shape[0], 3, device=device, requires_grad=True)
+            # === Rasterize for gradient flow ===
+            colors_feats = torch.zeros((self.gaussian_model._xyz.shape[0], embed_dim), device=device, dtype=torch.float16)
+            colors_feats.requires_grad_(True)
+            colors_feats_0 = torch.zeros(self.gaussian_model._xyz.shape[0], 3, device=device, dtype=torch.float16)
+            colors_feats_0.requires_grad_(True)
 
-                # 1️⃣ Numerator rasterization
+            print(f"Memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 
-                output_for_grad, _, _ = rasterization(
-                    means=self.gaussian_model._xyz,
-                    quats=self.gaussian_model._rotation,
-                    scales=torch.exp(self.gaussian_model._scaling),
-                    opacities=torch.sigmoid(self.gaussian_model._opacity),
-                    colors=colors_feats.unsqueeze(1),  # match API shape [N, K, D]
-                    viewmats=viewmat,
-                    Ks=self.cam.Ks,
-                    width=W,
-                    height=H,
-                )
+            # 1️⃣ Numerator rasterization
 
-                target_feat = (output_for_grad[0] * feats).sum()
-                target_feat.backward()
+            output_for_grad, _, _ = rasterization(
+                means=self.gaussian_model._xyz,
+                quats=self.gaussian_model._rotation,
+                scales=torch.exp(self.gaussian_model._scaling),
+                opacities=torch.sigmoid(self.gaussian_model._opacity),
+                colors=colors_feats.unsqueeze(0),  # ✅ [1, N, D] (C=1, N, K)
+                viewmats=viewmat,
+                Ks=self.cam.Ks,
+                width=W,
+                height=H,
+            )
 
-                gaussian_features += colors_feats.grad.clone()
-                colors_feats.grad.zero_()
+            target_feat = (output_for_grad[0].to(torch.float16) * feats.to(torch.float16)).sum()
+            target_feat.backward()
 
-                # 2️⃣ Denominator rasterization
-                output_denom, _, _ = rasterization(
-                    means=self.gaussian_model._xyz,
-                    quats=self.gaussian_model._rotation,
-                    scales=torch.exp(self.gaussian_model._scaling),
-                    opacities=torch.sigmoid(self.gaussian_model._opacity),
-                    colors=colors_feats_0.unsqueeze(1),  # match API shape [N, K, D]
-                    viewmats=viewmat,
-                    Ks=self.cam.Ks,
-                    width=W,
-                    height=H,
-                )
+            gaussian_features += colors_feats.grad.clone()
+            colors_feats.grad.zero_()
 
-                target_denom = (output_denom[0]).sum()   # just sum all contributions
-                target_denom.backward()
+            # 2️⃣ Denominator rasterization
+            output_denom, _, _ = rasterization(
+                means=self.gaussian_model._xyz,
+                quats=self.gaussian_model._rotation,
+                scales=torch.exp(self.gaussian_model._scaling),
+                opacities=torch.sigmoid(self.gaussian_model._opacity),
+                colors=colors_feats_0.unsqueeze(0),  # ✅ [1, N, 1]
+                viewmats=viewmat,
+                Ks=self.cam.Ks,
+                width=W,
+                height=H,
+            )
 
-                gaussian_denoms += colors_feats_0.grad[:, 0]
-                colors_feats_0.grad.zero_()
+            target_denom = (output_denom[0]).sum()   # just sum all contributions
+            target_denom.backward()
 
-                # Clear unused variables and caches
-                del viewmat, feats, output_for_grad, output_denom, target_feat, target_denom
-                gc.collect()
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
+            gaussian_denoms += colors_feats_0.grad[:, 0]
+            colors_feats_0.grad.zero_()
+            print(f"Memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 
-            gaussian_features = gaussian_features / gaussian_denoms[..., None]
-            gaussian_features = torch.nn.functional.normalize(gaussian_features, dim=-1)
-            gaussian_features[torch.isnan(gaussian_features)] = 0
-            print("✅ Computed per-Gaussian semantic features.")
-            
-            self.gaussian_model._feature_field = gaussian_features
 
-            return 
+            # Clear unused variables and caches
+            del viewmat, feats, output_for_grad, output_denom, target_feat, target_denom
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+        gaussian_features = gaussian_features / gaussian_denoms[..., None]
+        gaussian_features = torch.nn.functional.normalize(gaussian_features, dim=-1)
+        gaussian_features[torch.isnan(gaussian_features)] = 0
+        print("✅ Computed per-Gaussian semantic features.")
+        
+        self.gaussian_model._feature_field = gaussian_features
+
+        return 
 
 
     def vr_walkthrough_pygame(self, record_mode):
@@ -1590,13 +1662,94 @@ def calculate_gaussian_feature_field_main(sh_degree, ply_file_path, out_dir):
     
     splat_app = SPLAT_APP(cam, gaussian_model, recorder)
 
-    splat_segmenter = SplatSegmenter(out_dir)
+    # splat_segmenter = SplatSegmenter(out_dir)
 
-    splat_segmenter.segment_splat_image_dir(record_mode=True)
+    # splat_segmenter.segment_splat_image_dir(record_mode=True)
 
-    del splat_segmenter
+    # del splat_segmenter
 
     splat_app.transfer_saved_features_to_splat(out_dir)
+
+
+
+# ------------------------------
+# Training loop
+# ------------------------------
+
+def train_autoencoder(
+    feature_dir,
+    latent_dim=32,
+    epochs=10,
+    batch_size=1024,
+    lr=1e-3,
+    sample_size=100_000,
+    use_mixed_precision=True,
+):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    dataset = CLIPFeatureDataset(feature_dir, sample_size=sample_size)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+
+    model = CLIPAutoencoder(input_dim=512, latent_dim=latent_dim).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+
+    scaler = torch.cuda.amp.GradScaler(enabled=use_mixed_precision)
+
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}"):
+            batch = batch.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=use_mixed_precision):
+                rec, _ = model(batch)
+                loss = criterion(rec, batch)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += loss.item() * batch.size(0)
+
+        avg_loss = running_loss / len(dataset)
+        print(f"🧠 Epoch {epoch+1}/{epochs} | Avg MSE Loss: {avg_loss:.6f}")
+
+        # Save checkpoint every epoch
+        ckpt_path = os.path.join(feature_dir, f"autoencoder_{latent_dim}d_epoch{epoch+1}.pth")
+        torch.save(model.state_dict(), ckpt_path)
+        print(f"💾 Saved checkpoint: {ckpt_path}")
+
+    # Save final model
+    final_path = os.path.join(feature_dir, f"autoencoder_{latent_dim}d_final.pth")
+    torch.save(model.state_dict(), final_path)
+    print(f"✅ Training complete! Saved final model to {final_path}")
+
+    return model
+
+
+# ------------------------------
+# Helper: encode & save compressed features
+# ------------------------------
+
+def encode_feature_maps(model, feature_dir, latent_dim):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device).eval()
+
+    latent_dir = os.path.join(feature_dir, f"latent_{latent_dim}d")
+    os.makedirs(latent_dir, exist_ok=True)
+
+    with torch.no_grad():
+        for f in tqdm(sorted(glob.glob(os.path.join(feature_dir, "*.pt"))), desc="Encoding feature maps"):
+            feat = torch.load(f, map_location=device)  # [H, W, 512]
+            H, W, _ = feat.shape
+            z = model.encoder(feat.view(-1, 512))
+            z = z.view(H, W, latent_dim)
+            save_path = os.path.join(latent_dir, os.path.basename(f))
+            torch.save(z.half().cpu(), save_path)
+    print(f"✅ Encoded latent features saved to {latent_dir}")
+
 
 
 def main():
@@ -1625,3 +1778,26 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # parser = argparse.ArgumentParser(description="Train Autoencoder on CLIP feature maps")
+    # parser.add_argument("--feature_dir", type=str, required=True, help="Path to folder with .pt feature maps")
+    # parser.add_argument("--latent_dim", type=int, default=32, help="Latent space dimensionality")
+    # parser.add_argument("--epochs", type=int, default=10)
+    # parser.add_argument("--batch_size", type=int, default=1024)
+    # parser.add_argument("--lr", type=float, default=1e-3)
+    # parser.add_argument("--sample_size", type=int, default=100_000)
+    # parser.add_argument("--no_amp", action="store_true", help="Disable mixed precision training")
+
+    # args = parser.parse_args()
+
+    # model = train_autoencoder(
+    #     args.feature_dir,
+    #     latent_dim=args.latent_dim,
+    #     epochs=args.epochs,
+    #     batch_size=args.batch_size,
+    #     lr=args.lr,
+    #     sample_size=args.sample_size,
+    #     use_mixed_precision=not args.no_amp,
+    # )
+
+    # # Optional: encode all maps into latent representations
+    # encode_feature_maps(model, args.feature_dir, args.latent_dim)
