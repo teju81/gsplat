@@ -1000,8 +1000,9 @@ class SPLAT_APP:
 
                 # Clear unused variables and caches
                 del viewmat, feats, output_for_grad, output_denom, target_feat, target_denom
+                gc.collect()
                 torch.cuda.empty_cache()
-                #torch.cuda.synchronize()
+                torch.cuda.synchronize()
 
             gaussian_features = gaussian_features / gaussian_denoms[..., None]
             gaussian_features = torch.nn.functional.normalize(gaussian_features, dim=-1)
