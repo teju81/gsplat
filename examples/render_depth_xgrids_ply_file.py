@@ -1007,6 +1007,7 @@ class SPLAT_APP:
         # === Iterate over all frames ===
         for frame_id_str, pose_list in pose_data.items():
             frame_id = int(frame_id_str)
+            print(f"processing frame id: {frame_id}...")
             if frame_id > 20:
                 break
             feat_path = input_dir / "features" / "latent_32d" / f"frame_{frame_id:04d}.pt"
@@ -1022,12 +1023,10 @@ class SPLAT_APP:
             viewmat = torch.linalg.inv(pose.unsqueeze(0))  # camera-to-world → world-to-camera
 
             # === Rasterize for gradient flow ===
-            colors_feats = torch.zeros((self.gaussian_model._xyz.shape[0], embed_dim), device=device, dtype=torch.float16)
+            colors_feats = torch.zeros((self.gaussian_model._xyz.shape[0], embed_dim), device=device, dtype=torch.float32)
             colors_feats.requires_grad_(True)
-            colors_feats_0 = torch.zeros(self.gaussian_model._xyz.shape[0], 3, device=device, dtype=torch.float16)
+            colors_feats_0 = torch.zeros(self.gaussian_model._xyz.shape[0], 3, device=device, dtype=torch.float32)
             colors_feats_0.requires_grad_(True)
-
-            print(f"Memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 
             # 1️⃣ Numerator rasterization
 
