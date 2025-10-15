@@ -530,17 +530,6 @@ class GaussianModel:
         return render_colors, render_alphas, info
 
 
-class CLIPFeatureExtractor:
-    def __init__(self, prompts=None):
-
-        if prompts is not None:
-            self.prompts = prompts
-        else:
-            self.prompts = ["floor", "wall", "pillars", "others"]
-
-
-
-
 class SplatSegmenter:
     def __init__(self, input_dir=None):
 
@@ -638,7 +627,10 @@ class SplatSegmenter:
 
                 # # ✅ Save feature map as .npy (numpy)
                 # np.save(self.FEATURE_DIR / (img_path.stem + ".npy"), feature_map_norm.cpu().numpy())
+                # Clear unused variables and caches
 
+            del image_source, image, annotated_frame_bgr, feature_map_norm
+            torch.cuda.empty_cache()
 
     def langsam_gaussian_segmenter(self, image_source, image):
 
@@ -886,7 +878,6 @@ class SPLAT_APP:
         self.cam = cam
         self.recorder = recorder
         self.splat_segmenter = SplatSegmenter(recorder.out_dir)
-        self.clip_feature_extractor = CLIPFeatureExtractor()
         self.transform = T.Compose(
         [
             T.RandomResize([800], max_size=1333),
@@ -1624,6 +1615,8 @@ def calculate_gaussian_feature_field_main(sh_degree, ply_file_path, out_dir):
     splat_segmenter = SplatSegmenter(out_dir)
 
     splat_segmenter.segment_splat_image_dir(record_mode=True)
+
+    del splat_segmenter
 
     splat_app.transfer_saved_features_to_splat(out_dir)
 
