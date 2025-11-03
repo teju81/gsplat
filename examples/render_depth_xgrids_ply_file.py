@@ -1796,7 +1796,7 @@ def main():
 
     sh_degree = 3
     #ply_file_path="/root/code/datasets/xgrids/LCC_output/AG_Office/ply-result/point_cloud/iteration_100/point_cloud.ply"
-    ply_file_path="/root/code/ubuntu_data/datasets/ARTGarage/lab_office_in_out_k1_scanner/output/LCC_Studio_GaussianSplat_out/AG_lab/ply-result/point_cloud/iteration_100/point_cloud.ply"
+    ply_file_path="/root/code/ubuntu_data/datasets/ARTGarage/lab_office_in_out_k1_scanner/output/LCC_Studio_GaussianSplat_out/AG_Office/ply-result/point_cloud/iteration_100/point_cloud.ply"
 
     # sh_degree = 3
     # ply_file_path="/root/code/datasets/ARTGarage/lab_office_in_out_k1_scanner/LCC_Studio_GaussianSplat_out/AG_lab/ply-result/point_cloud/iteration_100/point_cloud.ply"
