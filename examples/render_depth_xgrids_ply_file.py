@@ -922,8 +922,14 @@ class SPLAT_APP:
         ])
 
         #Define noise parameters for replaying training/recorded trajectories with noise injected
+
+        # for Uniformly Random Noise
         self.trans_noise=0.1
         self.rot_noise_deg=5.0
+
+        # for Normal Noise
+        self.std_dev_trans_noise=0.1
+        self.std_dev_rot_noise_deg=5.0
 
     def rasterize_rgbd(self):
 
@@ -1149,7 +1155,7 @@ class SPLAT_APP:
 
         pygame.quit()
 
-    def perturb_pose(self, pose: np.ndarray):
+    def perturb_pose_normal(self, pose: np.ndarray):
         """
         Args:
             pose: (4,4) numpy array, camera-to-world
@@ -1157,17 +1163,38 @@ class SPLAT_APP:
             rot_noise_deg: std dev of rotation noise (degrees)
         """
         # Translation noise
-        noisy_t = pose[:3, 3] + np.random.normal(0, self.trans_noise, 3)
+        noisy_t = pose[:3, 3] + np.random.normal(0, self.std_dev_trans_noise, 3)
 
         # Rotation noise
         R_mat = pose[:3, :3]
-        noise_rot = R.from_euler('xyz', np.random.normal(0, self.rot_noise_deg, 3), degrees=True).as_matrix()
+        noise_rot = R.from_euler('xyz', np.random.normal(0, self.std_dev_rot_noise_deg, 3), degrees=True).as_matrix()
         noisy_R = noise_rot @ R_mat
 
         noisy_pose = np.eye(4, dtype=np.float32)
         noisy_pose[:3, :3] = noisy_R
         noisy_pose[:3, 3] = noisy_t
         return noisy_pose
+
+    def perturb_pose_uniform(self, pose: np.ndarray):
+        """
+        Args:
+            pose: (4,4) numpy array, camera-to-world
+            trans_noise: Absolute maximum noise for uniformly random translation noise
+            rot_noise_deg: Absolute maximum noise for uniformly random rotation noise (degrees)
+        """
+        # Translation noise
+        noisy_t = pose[:3, 3] + np.random.uniform(-self.trans_noise, self.trans_noise, 3)
+
+        # Rotation noise
+        R_mat = pose[:3, :3]
+        noise_rot = R.from_euler('xyz', np.random.uniform(-self.rot_noise_deg, self.rot_noise_deg, 3), degrees=True).as_matrix()
+        noisy_R = noise_rot @ R_mat
+
+        noisy_pose = np.eye(4, dtype=np.float32)
+        noisy_pose[:3, :3] = noisy_R
+        noisy_pose[:3, 3] = noisy_t
+        return noisy_pose
+
 
     def replay_with_noise(self, pose_file=None, suffix="noisy"):
 
@@ -1199,7 +1226,7 @@ class SPLAT_APP:
             pose = np.array(pose, dtype=np.float32)
 
             # Perturb pose
-            noisy_pose = self.perturb_pose(pose)
+            noisy_pose = self.perturb_pose_uniform(pose)
 
             self.cam.T = torch.from_numpy(noisy_pose).unsqueeze(0).cuda()
 
@@ -1627,19 +1654,30 @@ def splat_app_main(sh_degree, ply_file_path, out_dir):
 
 
     # First interactively record trajectory
-    splat_app.vr_walkthrough_pygame(record_mode)
-    print("Walk through is done... Replay with noise now....")
+    # splat_app.vr_walkthrough_pygame(record_mode)
+    # print("Walk through is done... Replay with noise now....")
 
-    # #Define noise parameters for replaying training/recorded trajectories with noise injected
-    # splat_app.trans_noise=0.1
-    # splat_app.rot_noise_deg=5.0
-    # splat_app.replay_with_noise(suffix="noisy1")
+    #Define noise parameters for replaying training/recorded trajectories with noise injected
+    splat_app.trans_noise=0.025
+    splat_app.rot_noise_deg=1.25
+    splat_app.replay_with_noise(suffix="noisy1")
+    print("Replay with noise done.... Replaying another time with more noise...")
+
+    # splat_app.trans_noise=0.05
+    # splat_app.rot_noise_deg=2.5
+    # splat_app.replay_with_noise(suffix="noisy2")
     # print("Replay with noise done.... Replaying another time with more noise...")
 
-    # splat_app.trans_noise=0.2
-    # splat_app.rot_noise_deg=10.0
-    # splat_app.replay_with_noise(suffix="noisy2")
-    # print("Replay with more noise done....")
+
+    # splat_app.trans_noise=0.075
+    # splat_app.rot_noise_deg=3.75
+    # splat_app.replay_with_noise(suffix="noisy3")
+    # print("Replay with noise done.... Replaying another time with more noise...")
+
+    # splat_app.trans_noise=0.1
+    # splat_app.rot_noise_deg=5.0
+    # splat_app.replay_with_noise(suffix="noisy4")
+    # print("Replay with noise done.... Replaying another time with more noise...")
 
 
     # # Option 3: Replay training poses with noise
@@ -1758,7 +1796,7 @@ def main():
 
     sh_degree = 3
     #ply_file_path="/root/code/datasets/xgrids/LCC_output/AG_Office/ply-result/point_cloud/iteration_100/point_cloud.ply"
-    ply_file_path="/root/code/datasets/ARTGarage/lab_office_in_out_k1_scanner/output/LCC_Studio_GaussianSplat_out/AG_lab/ply-result/point_cloud/iteration_100/point_cloud.ply"
+    ply_file_path="/root/code/ubuntu_data/datasets/ARTGarage/lab_office_in_out_k1_scanner/output/LCC_Studio_GaussianSplat_out/AG_lab/ply-result/point_cloud/iteration_100/point_cloud.ply"
 
     # sh_degree = 3
     # ply_file_path="/root/code/datasets/ARTGarage/lab_office_in_out_k1_scanner/LCC_Studio_GaussianSplat_out/AG_lab/ply-result/point_cloud/iteration_100/point_cloud.ply"
@@ -1766,10 +1804,10 @@ def main():
     #sh_degree = 0
     #ply_file_path="/root/code/datasets/xgrids/LCC_output/portal_cam_output_LCC/output/ply-result/point_cloud/iteration_100/point_cloud_1.ply"
 
-    out_dir = Path("/root/code/output/gaussian_splatting/xgrids_test4/")
+    out_dir = Path("/root/code/output/second_floor_trajectory/")
 
 
-    if 0:
+    if 1:
         splat_app_main(sh_degree, ply_file_path, out_dir)
     else:
         calculate_gaussian_feature_field_main(sh_degree, ply_file_path, out_dir)
