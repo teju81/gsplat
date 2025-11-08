@@ -15,6 +15,7 @@ import imageio.v3 as iio
 import numpy as np
 import struct
 import threading
+import cv2
 
 # --- gsplat rasterizer import ---
 try:
@@ -185,6 +186,33 @@ def _call_rasterizer(means, scales, quats, opacities, colors,
     return rgb[0]
 
 
+def show_side_by_side(gt_tensor, rendered_tensor, epoch, window_name="GT vs Rendered", save_dir=None):
+    """
+    Display or save side-by-side GT vs Rendered image comparison.
+    gt_tensor, rendered_tensor: torch tensors in range [0,1], shape (H,W,3)
+    """
+    gt_np = (gt_tensor.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+    rendered_np = (rendered_tensor.detach().cpu().numpy().squeeze() * 255).clip(0, 255).astype(np.uint8)
+
+    # Resize both to same dimensions if needed
+    h, w, _ = gt_np.shape
+    rendered_np = cv2.resize(rendered_np, (w, h), interpolation=cv2.INTER_AREA)
+
+    combined = np.concatenate([gt_np, rendered_np], axis=1)
+    text = f"Epoch {epoch}"
+    cv2.putText(combined, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+
+    # if save_dir:
+    #     os.makedirs(save_dir, exist_ok=True)
+    #     out_path = os.path.join(save_dir, f"epoch_{epoch:03d}.jpg")
+    #     cv2.imwrite(out_path, combined)
+
+    # Show interactively
+    cv2.imshow(window_name, combined[..., ::-1])  # convert RGB→BGR
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
 # ----------------------------------------------------------------------
 # 🏋️‍♂️ Training loop
 # ----------------------------------------------------------------------
@@ -257,6 +285,15 @@ def train_xgrids(scene_dir: str, lr: float = 1e-3, epochs: int = 50, znear: floa
             viewer.update(means.detach().cpu(), scales.detach().cpu(),
                           rotations.detach().cpu(), colors.detach().cpu(),
                           opacities.detach().cpu())
+
+
+        # ✅ Display GT vs Rendered for the first valid frame of the epoch
+        if valid > 0:
+            try:
+                show_side_by_side(gt, rendered, epoch, window_name="GT vs Rendered",
+                                  save_dir=os.path.join(scene_dir, "epoch_visuals"))
+            except Exception as e:
+                print(f"⚠️ Visualization failed: {e}")
 
     # Save trained model
     out_path = os.path.join(scene_dir, "xgrids_refined_3dgs.pt")
