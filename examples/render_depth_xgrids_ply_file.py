@@ -127,19 +127,21 @@ class Recorder:
         self.depth_dir = self.out_dir / f"depth{suffix}"
         self.seg_dir = self.out_dir / f"seg{suffix}"
         self.norm_depth_dir = self.out_dir / f"norm_depth{suffix}"
+        self.screen_capture_dir = self.out_dir / f"screen_capture{suffix}"
         self.json_path = self.out_dir / f"poses{suffix}.json"
 
         self.pose_data = {}
         self.noisy_pose_data = {}
         self.frame_id = 0
+        self.sc_frame_id = 0
 
         os.makedirs(self.color_dir, exist_ok=True)
         os.makedirs(self.depth_dir, exist_ok=True)
         os.makedirs(self.seg_dir, exist_ok=True)
         os.makedirs(self.norm_depth_dir, exist_ok=True)
+        os.makedirs(self.screen_capture_dir, exist_ok=True)
 
         print(f"🔄 Intializing recording....")
-
 
     def load_previous_state(self):
         """Resume from previous recording if json exists"""
@@ -148,6 +150,7 @@ class Recorder:
         self.depth_dir = self.out_dir / "depth"
         self.seg_dir = self.out_dir / "seg"
         self.norm_depth_dir = self.out_dir / "norm_depth"
+        self.screen_capture_dir = self.out_dir / "screen_capture"
 
         # Load JSON if it exists
         if self.json_path.exists():
@@ -166,8 +169,8 @@ class Recorder:
             self.noisy_pose_data = {}
             self.frame_id = 0
 
+        self.sc_frame_id = 0
         print(f"🔄 Resuming recording at frame {self.frame_id}")
-
 
     def record(self, rgb: np.ndarray, depth: np.ndarray, norm_depth: np.ndarray, pose: np.ndarray, noisy_pose: Optional[np.ndarray] = None, seg: Optional[np.ndarray] = None):
         """
@@ -208,6 +211,39 @@ class Recorder:
 
         print(f"✅ saved json file to {self.json_path}")
 
+    def screen_capture(self, rgb: np.ndarray, depth: np.ndarray, norm_depth: np.ndarray, pose: np.ndarray, Ks, noisy_pose: Optional[np.ndarray] = None, seg: Optional[np.ndarray] = None):
+        # File names
+        name = f"sc_frame_color_{self.sc_frame_id:04d}.png"
+        color_path = os.path.join(self.screen_capture_dir, name)
+        name = f"sc_frame_depth_{self.sc_frame_id:04d}.png"
+        depth_path = os.path.join(self.screen_capture_dir, name)
+        name = f"sc_frame_norm_depth_{self.sc_frame_id:04d}.png"
+        norm_depth_path = os.path.join(self.screen_capture_dir, name)
+        name = f"sc_pose_{self.sc_frame_id:04d}.json"
+        json_path = os.path.join(self.screen_capture_dir, name)
+
+        # Save images
+        cv2.imwrite(color_path, rgb)
+        cv2.imwrite(depth_path, depth)
+        cv2.imwrite(norm_depth_path, norm_depth)
+
+        if seg is not None:
+            name = f"sc_frame_norm_seg_{self.sc_frame_id:04d}.png"
+            seg_path = os.path.join(self.screen_capture_dir, name)
+            cv2.imwrite(seg_path, seg)
+
+        print(f"Camera Pose {pose}")
+
+        all_data = {
+            "Ks": Ks.cpu().numpy().tolist(),
+            "pose": pose.tolist()
+        }
+        with open(json_path, 'w') as f:
+            json.dump(all_data, f, indent=4)
+
+        print(f"saved json file to {json_path}")
+
+        self.sc_frame_id += 1
 
 class Camera:
     def __init__(self, H=1080, W=1920, fx=1080, fy=1080, near_plane=0.001, far_plane=100.0):
@@ -1107,6 +1143,8 @@ class SPLAT_APP:
             self.recorder.save_json_flag = True
 
         running = True
+        show_help_menu = False
+        screen_capture = False
 
         while running:
             for event in pygame.event.get():
@@ -1121,6 +1159,12 @@ class SPLAT_APP:
                             self.recorder.save_json_flag = True
                         elif record_mode in [Record_Mode.RECORD, Record_Mode.CONTINUE]:
                             record_mode = Record_Mode.PAUSE
+                    elif event.key == pygame.K_h:
+                        show_help_menu = not show_help_menu
+                    elif event.key == pygame.K_c:
+                        screen_capture = True
+
+
                 # elif event.type == pygame.MOUSEMOTION:
                 #     handle_mouse_input(event)
 
@@ -1134,13 +1178,26 @@ class SPLAT_APP:
                 #self.recorder.record(rgb=rgb_vis_3dgs_bgr, depth=rendered_depth_3dgs, norm_depth=depth_vis_3dgs, pose=pose, seg=seg_img)
                 self.recorder.record(rgb=rgb_vis_3dgs_bgr, depth=rendered_depth_3dgs, norm_depth=depth_vis_3dgs, pose=pose)
 
+            if screen_capture:
+                self.recorder.screen_capture(rgb=rgb_vis_3dgs_bgr, depth=rendered_depth_3dgs, norm_depth=depth_vis_3dgs, pose=pose, Ks=self.cam.Ks)
+                screen_capture = False
+
+
             # === Display the output image ===
             # Convert the NumPy array to a Pygame surface
             # The swapaxes() is crucial because NumPy arrays and Pygame surfaces have different memory layouts.
             # NumPy is (height, width, channels), Pygame is (width, height, channels).
 
             rgb_game_img = rgb_vis_3dgs.copy()
-            cv2.putText(rgb_game_img, f"Record Mode: {record_mode}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+            cv2.putText(rgb_game_img, f"Record Mode: {record_mode}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+            if show_help_menu:
+                cv2.putText(rgb_game_img, "Help Menu - Keyboard Shortcuts", (100, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+                cv2.putText(rgb_game_img, "C - For Screenshot of Current Camera Render", (100, 250), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "WASD - For Translational Camera Control", (100, 350), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "IK - YAW Camera Control", (100, 450), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "JL - Pitch Camera Control", (100, 550), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "UO - Roll Camera Control", (100, 650), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+
 
             image_surface = pygame.surfarray.make_surface(rgb_game_img.swapaxes(0, 1))
 
@@ -1654,14 +1711,14 @@ def splat_app_main(sh_degree, ply_file_path, out_dir):
 
 
     # First interactively record trajectory
-    # splat_app.vr_walkthrough_pygame(record_mode)
-    # print("Walk through is done... Replay with noise now....")
+    splat_app.vr_walkthrough_pygame(record_mode)
+    print("Walk through is done... Replay with noise now....")
 
     #Define noise parameters for replaying training/recorded trajectories with noise injected
-    splat_app.trans_noise=0.025
-    splat_app.rot_noise_deg=1.25
-    splat_app.replay_with_noise(suffix="noisy1")
-    print("Replay with noise done.... Replaying another time with more noise...")
+    # splat_app.trans_noise=0.025
+    # splat_app.rot_noise_deg=1.25
+    # splat_app.replay_with_noise(suffix="noisy1")
+    # print("Replay with noise done.... Replaying another time with more noise...")
 
     # splat_app.trans_noise=0.05
     # splat_app.rot_noise_deg=2.5
@@ -1797,6 +1854,8 @@ def main():
     sh_degree = 3
     #ply_file_path="/root/code/datasets/xgrids/LCC_output/AG_Office/ply-result/point_cloud/iteration_100/point_cloud.ply"
     ply_file_path="/root/code/ubuntu_data/datasets/ARTGarage/lab_office_in_out_k1_scanner/output/LCC_Studio_GaussianSplat_out/AG_Office/ply-result/point_cloud/iteration_100/point_cloud.ply"
+    ply_file_path="/root/code/ubuntu_data/datasets/ARTGarage/ARTLabs/output/ply-result/point_cloud/iteration_100/point_cloud.ply"
+
 
     # sh_degree = 3
     # ply_file_path="/root/code/datasets/ARTGarage/lab_office_in_out_k1_scanner/LCC_Studio_GaussianSplat_out/AG_lab/ply-result/point_cloud/iteration_100/point_cloud.ply"
