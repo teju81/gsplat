@@ -630,7 +630,10 @@ class SplatSegmenter:
         Hyper parameters
         """
         #self.text = "floor. wall. pillars. plants. door. window. fan. chair. machine. fire extinguisher. shoe rack. traffic cone. chain."
-        self.text = "floor. wall. pillars."
+        #self.text = "floor. wall. pillars."
+        self.text = "floor. wall. curtain. door. window. fan. chair. table. mouse. keyboard. glass. water dispenser. fire extinguisher. laptop. \
+            monitor. phone. cupboard. bag. lock. chessboard. cup. soda. bin. drawer. \
+            tv. light. pen. cloth."
 
         self.class_names = [cls.strip().rstrip('.') for cls in self.text.split('.') if cls.strip()]
         self.clip_embedding_classes = self.class_names + ["others"]
@@ -716,14 +719,26 @@ class SplatSegmenter:
             if record_mode:
                 cv2.imwrite(os.path.join(self.OUTPUT_DIR, img_path.name), annotated_frame_bgr)
 
-                # ✅ Save feature map as .pt (PyTorch tensor)
-                feature_save_path = self.FEATURE_DIR / (img_path.stem + ".pt")
-                torch.save(feature_map_norm, feature_save_path)
-                print(f"💾 Saved feature map: {feature_save_path}")
+                # if 1:
+                #     # ✅ Save feature map as .pt (PyTorch tensor)
+                #     feature_save_path = self.FEATURE_DIR / (img_path.stem + ".pt")
+                #     torch.save(feature_map_norm, feature_save_path)
+                #     print(f"💾 Saved feature map: {feature_save_path}")
+                # else:
+                #     pass
 
-                # # ✅ Save feature map as .npy (numpy)
-                # np.save(self.FEATURE_DIR / (img_path.stem + ".npy"), feature_map_norm.cpu().numpy())
-                # Clear unused variables and caches
+                #     # # ✅ Save feature map as .npy (numpy)
+                #     # np.save(self.FEATURE_DIR / (img_path.stem + ".npy"), feature_map_norm.cpu().numpy())
+                #     # Clear unused variables and caches
+
+                # ✅ Save AnyLabeling JSON annotation
+                self.save_anylabeling_json(
+                    img_path=img_path,
+                    gdino_labels=self.last_gdino_labels,
+                    boxes=self.last_boxes,
+                    masks=self.last_masks,
+                    scores=self.last_confidences
+                )
 
             del image_source, image, annotated_frame_bgr, feature_map_norm
             gc.collect()
@@ -788,6 +803,12 @@ class SplatSegmenter:
             masks = masks.squeeze(1)
 
         gdino_detection_confidences = gdino_detection_confidences.numpy().tolist()
+
+        # Store for JSON export
+        self.last_boxes = input_boxes.tolist()
+        self.last_confidences = gdino_detection_confidences
+        self.last_gdino_labels = gdino_detection_labels
+        self.last_masks = masks.cpu().numpy() if isinstance(masks, torch.Tensor) else masks
 
         class_ids = np.array(list(range(len(gdino_detection_labels))))
 
@@ -943,6 +964,72 @@ class SplatSegmenter:
             print(f"Class: {key}, Embedding Shape: {embedding.shape}")
         return
 
+    def save_anylabeling_json(self, img_path, gdino_labels, boxes, masks, scores):
+        """
+        Save Grounded SAM2 detections in AnyLabeling-compatible JSON format.
+        Ensures all coordinates are ints (Qt crashes otherwise).
+        """
+        import cv2, json
+        from PIL import Image
+
+        # Read actual image dimensions
+        img = Image.open(img_path)
+        W, H = img.size
+
+        shapes = []
+
+        for i, (label, box, score) in enumerate(zip(gdino_labels, boxes, scores)):
+            # --- round/convert coordinates to int ---
+            x1, y1, x2, y2 = [int(round(v)) for v in box]
+
+            # rectangle shape
+            shapes.append({
+                "label": str(label),
+                "text": f"{score:.2f}",
+                "points": [[x1, y1], [x2, y2]],
+                "group_id": None,
+                "shape_type": "rectangle",
+                "flags": {}
+            })
+
+            # --- Optional: polygon mask ---
+            if masks is not None and len(masks) > i:
+                mask = masks[i].astype(np.uint8)
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                for contour in contours:
+                    polygon = contour.squeeze(1)
+                    if len(polygon.shape) != 2 or polygon.shape[0] < 3:
+                        continue
+                    # ensure integers
+                    polygon = [[int(round(float(x))), int(round(float(y)))] for x, y in polygon]
+                    shapes.append({
+                        "label": str(label),
+                        "text": f"{score:.2f}",
+                        "points": polygon,
+                        "group_id": None,
+                        "shape_type": "polygon",
+                        "flags": {}
+                    })
+
+        json_data = {
+            "version": "0.4.30",
+            "flags": {},
+            "shapes": shapes,
+            "imagePath": img_path.name,
+            "imageData": None,
+            "imageHeight": H,
+            "imageWidth": W,
+            "text": ""
+        }
+
+        json_save_path = self.OUTPUT_DIR / f"{img_path.stem}.json"
+        with open(json_save_path, "w") as f:
+            json.dump(json_data, f, indent=2)
+
+        print(f"💾 Saved AnyLabeling JSON (no floats): {json_save_path}")
+
+
+
 class SPLAT_APP:
     def __init__(self, cam, gaussian_model, recorder):
 
@@ -1010,9 +1097,9 @@ class SPLAT_APP:
 
         rgb_vis_3dgs_bgr = cv2.cvtColor(rgb_vis_3dgs, cv2.COLOR_RGB2BGR)
         
-        # image_pil = Image.fromarray(rgb_vis_3dgs_bgr) 
-        # image_transformed, _ = self.transform(image_pil, None)
-        # seg_img = self.splat_segmenter.langsam_gaussian_segmenter(rgb_vis_3dgs_bgr, image_transformed)
+        image_pil = Image.fromarray(rgb_vis_3dgs_bgr) 
+        image_transformed, _ = self.transform(image_pil, None)
+        seg_img = self.splat_segmenter.langsam_gaussian_segmenter(rgb_vis_3dgs_bgr, image_transformed)
         seg_img = None
 
         return rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs, seg_img
@@ -1756,13 +1843,14 @@ def calculate_gaussian_feature_field_main(sh_degree, ply_file_path, out_dir):
     
     splat_app = SPLAT_APP(cam, gaussian_model, recorder)
 
-    # splat_segmenter = SplatSegmenter(out_dir)
+    if 1:
+        splat_segmenter = SplatSegmenter(out_dir)
 
-    # splat_segmenter.segment_splat_image_dir(record_mode=True)
+        splat_segmenter.segment_splat_image_dir(record_mode=True)
 
-    # del splat_segmenter
-
-    splat_app.transfer_saved_features_to_splat(out_dir)
+        del splat_segmenter
+    else:
+        splat_app.transfer_saved_features_to_splat(out_dir)
 
 
 
@@ -1866,7 +1954,7 @@ def main():
     out_dir = Path("/root/code/output/second_floor_trajectory/")
 
 
-    if 1:
+    if 0:
         splat_app_main(sh_degree, ply_file_path, out_dir)
     else:
         calculate_gaussian_feature_field_main(sh_degree, ply_file_path, out_dir)
