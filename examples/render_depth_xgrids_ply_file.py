@@ -704,8 +704,8 @@ class SplatSegmenter:
 
         # list all images
         for frame_id, img_path in enumerate(sorted(self.img_dir.iterdir())):
-            if frame_id > 20:
-                break
+            # if frame_id > 20:
+            #     break
             if img_path.suffix.lower() not in extensions:
                 continue  # skip non-image files
             print(f"🔹 Processing: {img_path}")
@@ -1096,11 +1096,17 @@ class SPLAT_APP:
 
 
         rgb_vis_3dgs_bgr = cv2.cvtColor(rgb_vis_3dgs, cv2.COLOR_RGB2BGR)
-        
-        image_pil = Image.fromarray(rgb_vis_3dgs_bgr) 
-        image_transformed, _ = self.transform(image_pil, None)
-        seg_img = self.splat_segmenter.langsam_gaussian_segmenter(rgb_vis_3dgs_bgr, image_transformed)
-        seg_img = None
+
+
+        # Whe doing VR walkthrough dont run segmentation as it makes it very slow
+
+        # Enable for VR walk through, disable for segmentation
+        if 1:
+            seg_img = None
+        else:
+            image_pil = Image.fromarray(rgb_vis_3dgs_bgr) 
+            image_transformed, _ = self.transform(image_pil, None)
+            seg_img = self.splat_segmenter.langsam_gaussian_segmenter(rgb_vis_3dgs_bgr, image_transformed)
 
         return rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs, seg_img
 
@@ -1951,10 +1957,15 @@ def main():
     #sh_degree = 0
     #ply_file_path="/root/code/datasets/xgrids/LCC_output/portal_cam_output_LCC/output/ply-result/point_cloud/iteration_100/point_cloud_1.ply"
 
-    out_dir = Path("/root/code/output/second_floor_trajectory/")
+    out_dir = Path("/root/code/output/segmentation_testing/")
 
 
-    if 0:
+    # First perform VR walk through (disable segmentation inside vr walkthrough rasterizer as well) and record a trajectory
+    # Then run calculate gaussian feature field for segmenting the images recorded
+    # Disable feature field calculation when segmentation is being run if you want
+    # Run AnyLabel to improve annotation performance
+    # Enable feature field calculation if you want to lift the segmentation into the Gaussians via backpropagation
+    if 1:
         splat_app_main(sh_degree, ply_file_path, out_dir)
     else:
         calculate_gaussian_feature_field_main(sh_degree, ply_file_path, out_dir)
