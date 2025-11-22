@@ -1044,7 +1044,7 @@ class SPLAT_APP:
 
         return colors, depths
 
-    def rasterize_images_and_segment(self):
+    def rasterize_images(self):
 
         # === Call the Gaussian Rasterizer ===
         colors, depths = self.rasterize_rgbd()
@@ -1064,17 +1064,7 @@ class SPLAT_APP:
         rgb_vis_3dgs_bgr = cv2.cvtColor(rgb_vis_3dgs, cv2.COLOR_RGB2BGR)
 
 
-        # Whe doing VR walkthrough dont run segmentation as it makes it very slow
-
-        # Enable for VR walk through, disable for segmentation
-        if 1:
-            seg_img = None
-        else:
-            image_pil = Image.fromarray(rgb_vis_3dgs_bgr) 
-            image_transformed, _ = self.transform(image_pil, None)
-            seg_img = self.splat_segmenter.langsam_gaussian_segmenter(rgb_vis_3dgs_bgr, image_transformed)
-
-        return rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs, seg_img
+        return rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs
 
 
     def transfer_saved_features_to_splat(self, input_dir):
@@ -1187,11 +1177,21 @@ class SPLAT_APP:
 
     def select_object_interactively(self):
         
-        rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs, seg_img = self.rasterize_images_and_segment()
+        rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs = self.rasterize_images()
 
-        
-        #cv2.resizeWindow("grounded_sam2", 1600, 720)
-        cv2.imshow("grounded_sam2", rgb_vis_3dgs_bgr)
+        image_pil = Image.fromarray(rgb_vis_3dgs_bgr) 
+        image_transformed, _ = self.transform(image_pil, None)
+        seg_img, feature_map = self.splat_segmenter.langsam_gaussian_segmenter(rgb_vis_3dgs_bgr, image_transformed)
+
+        print(type(seg_img))
+        print(seg_img.shape)
+
+        cv2.namedWindow("RGB", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("RGB", 1600, 720)
+        cv2.imshow("RGB", rgb_vis_3dgs_bgr)
+        cv2.namedWindow("grounded_sam2", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("grounded_sam2", 1600, 720)
+        cv2.imshow("grounded_sam2", seg_img)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
 
@@ -1261,10 +1261,9 @@ class SPLAT_APP:
             pose = self.cam.T.squeeze(0).detach().cpu().numpy().astype(np.float32)
             self.cam.print_camera_pose()
 
-            rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs, seg_img = self.rasterize_images_and_segment()
+            rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs = self.rasterize_images()
 
             if record_mode in [Record_Mode.RECORD, Record_Mode.CONTINUE]:
-                #self.recorder.record(rgb=rgb_vis_3dgs_bgr, depth=rendered_depth_3dgs, norm_depth=depth_vis_3dgs, pose=pose, seg=seg_img)
                 self.recorder.record(rgb=rgb_vis_3dgs_bgr, depth=rendered_depth_3dgs, norm_depth=depth_vis_3dgs, pose=pose)
 
             if screen_capture:
@@ -1851,6 +1850,8 @@ def calculate_gaussian_feature_field_main(sh_degree, ply_file_path, out_dir):
     
     splat_app = SPLAT_APP(cam, gaussian_model, recorder)
 
+
+    # First segment splat image directory and then transfer the semantics to the 3DGS model
     if 1:
         splat_segmenter = SplatSegmenter(out_dir)
 
@@ -1987,13 +1988,13 @@ def main():
     # Run AnyLabel to improve annotation performance
     # Enable feature field calculation if you want to lift the segmentation into the Gaussians via backpropagation
 
-    if 1:
-        splat_app_main(sh_degree, ply_file_path, out_dir)
-    else:
-        calculate_gaussian_feature_field_main(sh_degree, ply_file_path, out_dir)
+    # if 1:
+    #     splat_app_main(sh_degree, ply_file_path, out_dir)
+    # else:
+    #     calculate_gaussian_feature_field_main(sh_degree, ply_file_path, out_dir)
 
 
-    # edit_gaussians_main(sh_degree, ply_file_path, out_dir)
+    edit_gaussians_main(sh_degree, ply_file_path, out_dir)
 
 
 if __name__ == "__main__":
