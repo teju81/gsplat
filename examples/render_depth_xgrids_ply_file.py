@@ -1000,6 +1000,17 @@ class SPLAT_APP:
     def __init__(self, cam, gaussian_model, recorder):
 
         self.gaussian_model = gaussian_model
+
+        # store a deep copy of original gaussians
+        self.original_gaussians = {
+            "_xyz": self.gaussian_model._xyz.clone(),
+            "_rotation": self.gaussian_model._rotation.clone(),
+            "_scaling": self.gaussian_model._scaling.clone(),
+            "_opacity": self.gaussian_model._opacity.clone(),
+            "_features_dc": self.gaussian_model._features_dc.clone(),
+            "_features_rest": self.gaussian_model._features_rest.clone(),
+        }
+
         self.cam = cam
         self.recorder = recorder
         self.splat_segmenter = SplatSegmenter(recorder.out_dir)
@@ -1175,45 +1186,428 @@ class SPLAT_APP:
 
         return 
 
+    def mask_to_gaussian_indices(self, mask_np: np.ndarray, min_grad: float = 1e-5):
+        """
+        Given a 2D binary mask over the rendered image, find which Gaussians
+        contributed to the pixels inside the mask.
+
+        Args:
+            mask_np: (H, W) uint8 or bool numpy mask (1 inside, 0 outside)
+            min_grad: threshold on gradient magnitude to keep a Gaussian
+
+        Returns:
+            selected_idx: np.ndarray of shape [M] with Gaussian indices
+        """
+        device = "cuda"
+        assert mask_np.ndim == 2, f"Expected 2D mask, got shape {mask_np.shape}"
+
+        H, W = mask_np.shape
+        N = self.gaussian_model._xyz.shape[0]
+
+        # Dummy per-Gaussian scalar "color" that we will differentiate w.r.t.
+        colors_feats = torch.zeros((N, 1), device=device, dtype=torch.float32, requires_grad=True)
+
+        # Camera/view
+        viewmats = torch.linalg.inv(self.cam.T.detach())  # [1, 4, 4]
+
+        # Rasterize with dummy scalar colors
+        render_scalar, _, _ = rasterization(
+            means=self.gaussian_model._xyz.detach(),
+            quats=self.gaussian_model._rotation.detach(),
+            scales=torch.exp(self.gaussian_model._scaling.detach()),
+            opacities=torch.sigmoid(self.gaussian_model._opacity.detach()),
+            colors=colors_feats.view(1, N, 1),          # [1, N, 1]
+            viewmats=viewmats,                          # [1, 4, 4]
+            Ks=self.cam.Ks.detach(),                    # [1, 3, 3]
+            width=W,
+            height=H,
+        )  # render_scalar: [1, H, W, 1]
+
+        # Convert mask to torch and apply to rendered scalar
+        mask_t = torch.from_numpy(mask_np.astype(np.float32)).to(device=device)
+        mask_t = mask_t.view(H, W, 1)  # [H, W, 1]
+
+        # Sum over masked pixels → scalar
+        target = (render_scalar[0] * mask_t).sum()
+        target.backward()
+
+        # Gradient w.r.t. per-Gaussian scalar tells you which Gaussians contributed
+        grad = colors_feats.grad.view(-1).abs()  # [N]
+
+        # Select those above some threshold
+        selected = (grad > min_grad).nonzero(as_tuple=False).view(-1)
+
+        selected_idx = selected.cpu().numpy()
+        print(f"✅ mask_to_gaussian_indices: selected {len(selected_idx)} / {N} gaussians")
+
+        return selected_idx
+
+
     def select_object_interactively(self):
-        
+
+        # Render current view
         rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs = self.rasterize_images()
 
-        image_pil = Image.fromarray(rgb_vis_3dgs_bgr) 
-        image_transformed, _ = self.transform(image_pil, None)
-        seg_img, feature_map = self.splat_segmenter.langsam_gaussian_segmenter(rgb_vis_3dgs_bgr, image_transformed)
+        # Run interactive SAM2 on the RGB image
+        mask_overlay, pos_points, neg_points = self.interactive_sam2_segmentation(rgb_vis_3dgs_bgr)
 
-        print(type(seg_img))
-        print(seg_img.shape)
+        if mask_overlay is None:
+            print("⚠️ No mask selected (user quit).")
+            return None
 
-        cv2.namedWindow("RGB", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("RGB", 1600, 720)
-        cv2.imshow("RGB", rgb_vis_3dgs_bgr)
-        cv2.namedWindow("grounded_sam2", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("grounded_sam2", 1600, 720)
-        cv2.imshow("grounded_sam2", seg_img)
+        # Make sure mask is H x W uint8
+        if mask_overlay.ndim == 3:
+            mask_overlay = mask_overlay.squeeze()
+        mask_overlay = (mask_overlay > 0).astype(np.uint8)
+
+        # Map 2D mask → Gaussians
+        gaussian_idx = self.mask_to_gaussian_indices(mask_overlay, min_grad=1e-5)
+
+        # Store for later editing
+        self.selected_gaussians = gaussian_idx
+        print(f"🎯 Stored {len(gaussian_idx)} selected Gaussians in self.selected_gaussians")
+
+        return gaussian_idx
+
+    def remove_selected_gaussians(self):
+        """
+        Remove the Gaussians in `self.selected_gaussians`
+        and update the gaussian_model to contain only the remaining ones.
+        """
+
+        if not hasattr(self, "selected_gaussians"):
+            print("⚠️ No gaussians selected. Run select_object_interactively() first.")
+            return
+
+        remove_idx = torch.from_numpy(self.selected_gaussians).to("cuda")
+        N = self.gaussian_model._xyz.shape[0]
+
+        mask = torch.ones(N, device="cuda", dtype=torch.bool)
+        mask[remove_idx] = False   # keep everything else
+
+        print(f"🗑️ Removing {remove_idx.numel()} gaussians, keeping {mask.sum().item()}")
+
+        # Update all gaussian attributes
+        with torch.no_grad():
+            self.gaussian_model._xyz        = self.gaussian_model._xyz[mask]
+            self.gaussian_model._rotation   = self.gaussian_model._rotation[mask]
+            self.gaussian_model._scaling    = self.gaussian_model._scaling[mask]
+            self.gaussian_model._opacity    = self.gaussian_model._opacity[mask]
+            self.gaussian_model._features_dc   = self.gaussian_model._features_dc[mask]
+            self.gaussian_model._features_rest = self.gaussian_model._features_rest[mask]
+
+
+    def shift_selected_gaussians(self, 
+                                 translation=(0,0,0), 
+                                 rotation_deg=(0,0,0)):
+        """
+        Apply a rigid transform to selected Gaussians: rotation + translation.
+
+        Args:
+            translation: (dx, dy, dz) in world coordinates
+            rotation_deg: (yaw, pitch, roll) in degrees
+        """
+        if not hasattr(self, "selected_gaussians"):
+            print("⚠️ No gaussians selected. Run select_object_interactively() first.")
+            return
+
+        sel = torch.from_numpy(self.selected_gaussians).to("cuda")
+
+        # ---- Extract dx, dy, dz ----
+        dx, dy, dz = translation
+        t = torch.tensor([dx, dy, dz], device="cuda", dtype=torch.float32)
+
+        # ---- Build rotation matrix ----
+        yaw, pitch, roll = rotation_deg
+        R_mat = R.from_euler("zyx", [yaw, pitch, roll], degrees=True).as_matrix()
+        R_torch = torch.tensor(R_mat, device="cuda", dtype=torch.float32)
+
+        with torch.no_grad():
+            # -------- 1. Update positions --------
+            xyz = self.gaussian_model._xyz[sel]
+            xyz_new = (xyz @ R_torch.T) + t
+            self.gaussian_model._xyz[sel] = xyz_new
+
+            # -------- 2. Update rotations --------
+            # original rotations are stored as quaternions in _rotation
+            q = self.gaussian_model._rotation[sel]  # [N, 4] (w,x,y,z)
+            q_rot = R.from_euler("zyx", [yaw, pitch, roll], degrees=True).as_quat()
+            q_rot_t = torch.tensor(q_rot, device="cuda", dtype=torch.float32)
+            
+            # quaternion multiply: q_new = q_rot * q_old
+            # (apply the new rotation in front)
+            def quat_mul(q1, q2):
+                # q1, q2: [N,4]
+                w1,x1,y1,z1 = q1.unbind(-1)
+                w2,x2,y2,z2 = q2.unbind(-1)
+                return torch.stack([
+                    w1*w2 - x1*x2 - y1*y2 - z1*z2,
+                    w1*x2 + x1*w2 + y1*z2 - z1*y2,
+                    w1*y2 - x1*z2 + y1*w2 + z1*x2,
+                    w1*z2 + x1*y2 - y1*x2 + z1*w2
+                ], dim=-1)
+
+            q_rot_rep = q_rot_t.expand_as(q)
+            self.gaussian_model._rotation[sel] = quat_mul(q_rot_rep, q)
+
+        print(f"✅ Shifted {sel.numel()} gaussians by translation={translation}, rotation={rotation_deg}")
+
+
+    def debug_render_original_and_edited(self):
+        """
+        Renders:
+            (1) Original gaussian splat
+            (2) Edited gaussian splat
+        Displays them side by side for visual comparison.
+        """
+
+        # ---- Render edited scene (current model) ----
+        rgb_edit, _, _, _ = self.rasterize_images()
+
+        # ---- Temporarily restore ORIGINAL gaussians ----
+        with torch.no_grad():
+            save_xyz        = self.gaussian_model._xyz.clone()
+            save_rot        = self.gaussian_model._rotation.clone()
+            save_scaling    = self.gaussian_model._scaling.clone()
+            save_opacity    = self.gaussian_model._opacity.clone()
+            save_fdc        = self.gaussian_model._features_dc.clone()
+            save_frest      = self.gaussian_model._features_rest.clone()
+
+            self.gaussian_model._xyz         = self.original_gaussians["_xyz"].clone()
+            self.gaussian_model._rotation    = self.original_gaussians["_rotation"].clone()
+            self.gaussian_model._scaling     = self.original_gaussians["_scaling"].clone()
+            self.gaussian_model._opacity     = self.original_gaussians["_opacity"].clone()
+            self.gaussian_model._features_dc = self.original_gaussians["_features_dc"].clone()
+            self.gaussian_model._features_rest = self.original_gaussians["_features_rest"].clone()
+
+        # ---- Render original scene ----
+        rgb_orig, _, _, _ = self.rasterize_images()
+
+        # ---- Restore the edited gaussians ----
+        with torch.no_grad():
+            self.gaussian_model._xyz         = save_xyz
+            self.gaussian_model._rotation    = save_rot
+            self.gaussian_model._scaling     = save_scaling
+            self.gaussian_model._opacity     = save_opacity
+            self.gaussian_model._features_dc = save_fdc
+            self.gaussian_model._features_rest = save_frest
+
+        # ---- Combine for display ----
+        combined = np.hstack([rgb_orig, rgb_edit])
+
+        cv2.namedWindow("Original (left)  |  Edited (right)", cv2.WINDOW_NORMAL)
+        cv2.imshow("Original (left)  |  Edited (right)", combined)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
 
-    def edit_gaussians_main(sh_degree, ply_file_path, out_dir):
-        
-        gaussian_model = GaussianModel(sh_degree, ply_file_path)
+        print("✅ Rendered original vs edited comparison.")
 
-        cam = init_cam()
-        
-        #record_mode = Record_Mode.CONTINUE
-        record_mode = Record_Mode.PAUSE
 
-        recorder = Recorder(out_dir, record_mode)
-        
-        splat_app = SPLAT_APP(cam, gaussian_model, recorder)
 
-        # Select Object Interactively
-        splat_app.select_object_interactively()
 
-        # # Walkthrough the splat to assess quality of edit
-        # splat_app.vr_walkthrough_pygame(record_mode)
-        # print("Walk through is done... Replay with noise now....")
+    # def debug_render_selected_gaussians(self):
+    #     """
+    #     Debug visualization:
+    #     - Render only the selected gaussians
+    #     - Render only the complement
+    #     Displays two windows:
+    #         1) "Selected Gaussians"
+    #         2) "Complement Gaussians"
+    #     """
+
+    #     if not hasattr(self, "selected_gaussians"):
+    #         print("⚠️ No selected_gaussians found. Run select_object_interactively() first.")
+    #         return
+
+    #     idx_np = self.selected_gaussians
+    #     idx = torch.from_numpy(idx_np).to("cuda")
+
+    #     N = self.gaussian_model._xyz.shape[0]
+    #     mask = torch.zeros(N, device="cuda", dtype=torch.bool)
+    #     mask[idx] = True
+
+    #     # Save original opacity
+    #     with torch.no_grad():
+    #         original_opacity = self.gaussian_model._opacity.clone()
+
+    #     # --------------------
+    #     # 1) Render SELECTED ONLY
+    #     # --------------------
+    #     with torch.no_grad():
+    #         self.gaussian_model._opacity.copy_(original_opacity)
+    #         self.gaussian_model._opacity[~mask] = -10.0  # hide others
+
+    #     rgb_selected, _, _, _ = self.rasterize_images()
+
+    #     # --------------------
+    #     # 2) Render COMPLEMENT ONLY
+    #     # --------------------
+    #     with torch.no_grad():
+    #         self.gaussian_model._opacity.copy_(original_opacity)
+    #         self.gaussian_model._opacity[mask] = -10.0  # hide selected
+
+    #     rgb_complement, _, _, _ = self.rasterize_images()
+
+    #     # --------------------
+    #     # Restore original opacity
+    #     # --------------------
+    #     with torch.no_grad():
+    #         self.gaussian_model._opacity.copy_(original_opacity)
+
+    #     # --------------------
+    #     # Display side-by-side
+    #     # --------------------
+    #     cv2.namedWindow("Selected Gaussians", cv2.WINDOW_NORMAL)
+    #     cv2.imshow("Selected Gaussians", rgb_selected)
+
+    #     cv2.namedWindow("Complement Gaussians", cv2.WINDOW_NORMAL)
+    #     cv2.imshow("Complement Gaussians", rgb_complement)
+
+    #     print(f"🎯 Debug render: selected {idx.numel()} gaussians, complement {N - idx.numel()}.")
+
+    #     cv2.waitKey(0)
+    #     cv2.destroyAllWindows()
+
+
+    def interactive_sam2_segmentation(self, image_rgb, device="cuda", dtype=torch.bfloat16):
+        """
+        Interactive SAM2 segmentation using positive/negative clicks.
+
+        Controls:
+            Left-click  = positive prompt
+            Right-click = negative prompt
+            ENTER       = finalize and return mask
+            r           = reset all points
+            q           = quit (returns None)
+        """
+
+        window_name = "Interactive SAM2 Segmentation"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+        H, W, _ = image_rgb.shape
+
+        img_disp = image_rgb.copy()
+        pos_points = []
+        neg_points = []
+        mask_overlay = None
+
+        # ---- wrapper so callback has correct scope ----
+        def callback(event, x, y, flags, param):
+            nonlocal pos_points, neg_points, mask_overlay, img_disp
+
+            if event == cv2.EVENT_LBUTTONDOWN:
+                pos_points.append((x, y))
+            elif event == cv2.EVENT_RBUTTONDOWN:
+                neg_points.append((x, y))
+            else:
+                return
+
+            # --- run SAM with updated points ---
+            mask_overlay = self.run_sam2_points(
+                image_rgb=image_rgb,
+                pos_points=pos_points,
+                neg_points=neg_points,
+                device=device,
+                dtype=dtype
+            )
+
+            # --- redraw ---
+            img_disp = self.draw_interaction(
+                image_rgb=image_rgb,
+                pos_points=pos_points,
+                neg_points=neg_points,
+                mask_overlay=mask_overlay
+            )
+
+        cv2.setMouseCallback(window_name, callback)
+
+        # === main loop ===
+        while True:
+            cv2.imshow(window_name, img_disp)
+            key = cv2.waitKey(20)
+
+            if key == 13:  # ENTER
+                cv2.destroyWindow(window_name)
+                return mask_overlay, pos_points, neg_points
+
+            elif key == ord('r'):
+                pos_points = []
+                neg_points = []
+                mask_overlay = None
+                img_disp = image_rgb.copy()
+
+            elif key == ord('q'):
+                cv2.destroyWindow(window_name)
+                return None, None, None
+
+
+    # ---------------------------------------------------------------
+    # Helper: Run SAM2 with point prompts
+    # ---------------------------------------------------------------
+    def run_sam2_points(self,
+        image_rgb,
+        pos_points,
+        neg_points,
+        device="cuda",
+        dtype=torch.bfloat16
+    ):
+
+        self.splat_segmenter.sam2_predictor.set_image(image_rgb)
+
+        point_coords = []
+        point_labels = []
+
+        if pos_points:
+            point_coords.extend(pos_points)
+            point_labels.extend([1] * len(pos_points))
+
+        if neg_points:
+            point_coords.extend(neg_points)
+            point_labels.extend([0] * len(neg_points))
+
+        if len(point_coords) == 0:
+            return None
+
+        point_coords = np.array(point_coords)
+        point_labels = np.array(point_labels)
+
+        with torch.no_grad(), torch.autocast(device_type=device, dtype=dtype):
+            masks, _, _ = self.splat_segmenter.sam2_predictor.predict(
+                point_coords=point_coords,
+                point_labels=point_labels,
+                multimask_output=False  # single best mask
+            )
+
+        m0 = masks[0]
+        if isinstance(m0, torch.Tensor):
+            mask = m0.detach().cpu().numpy().astype(np.uint8)
+        else:
+            mask = m0.astype(np.uint8)
+
+        return mask
+
+
+    # ---------------------------------------------------------------
+    # Helper: Draw clicks + mask overlay
+    # ---------------------------------------------------------------
+    def draw_interaction(self, image_rgb, pos_points, neg_points, mask_overlay):
+        overlay = image_rgb.copy()
+
+        # draw positive points (green)
+        for x, y in pos_points:
+            cv2.circle(overlay, (x, y), 5, (0, 255, 0), -1)
+
+        # draw negative points (red)
+        for x, y in neg_points:
+            cv2.circle(overlay, (x, y), 5, (0, 0, 255), -1)
+
+        # apply mask
+        if mask_overlay is not None:
+            masked = np.zeros_like(overlay)
+            masked[mask_overlay > 0] = (0, 255, 0)
+            overlay = cv2.addWeighted(overlay, 1.0, masked, 0.4, 0)
+
+        return overlay
 
     def vr_walkthrough_pygame(self, record_mode):
 
@@ -1958,10 +2352,20 @@ def edit_gaussians_main(sh_degree, ply_file_path, out_dir):
     # Select Object Interactively
     splat_app.select_object_interactively()
 
-    # # Walkthrough the splat to assess quality of edit
-    # splat_app.vr_walkthrough_pygame(record_mode)
-    # print("Walk through is done... Replay with noise now....")
+    # # Remove Selected Gaussians
+    # splat_app.remove_selected_gaussians()
 
+    # Move Selected Gaussians
+    splat_app.shift_selected_gaussians(translation=(1.0, 0.0, 0.5))
+
+    
+    # # Debug render to check editing quality
+    # splat_app.debug_render_original_and_edited()
+
+
+    # Walkthrough the splat to assess quality of edit
+    splat_app.vr_walkthrough_pygame(record_mode)
+    print("Walk through is done... Replay with noise now....")
 
 def main():
 
