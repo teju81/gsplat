@@ -281,57 +281,19 @@ class Camera:
         
         return
 
-    # def set_camera_viewpoint(self, tx, ty, tz, pos, yaw, pitch):
-    #     # Look direction vector
-    #     front = np.array([
-    #         np.cos(pitch) * np.sin(yaw),
-    #         np.sin(pitch),
-    #         np.cos(pitch) * np.cos(yaw)
-    #     ])
-    #     front = front / np.linalg.norm(front)
-
-    #     up = np.array([0.0, 1.0, 0.0])
-    #     right = np.cross(up, front)
-    #     up = np.cross(front, right)
-
-    #     R = torch.eye(4, dtype=torch.float32)
-
-    #     R[:3, 0] = torch.from_numpy(right).to(dtype=torch.float32)
-    #     R[:3, 1] = torch.from_numpy(up).to(dtype=torch.float32)
-    #     R[:3, 2] = torch.from_numpy(-front).to(dtype=torch.float32)
-
-    #     T = torch.eye(4, dtype=torch.float32)
-    #     T[:3, 3] = torch.from_numpy(-pos).to(dtype=torch.float32)
-    #     cam_pose = R @ T
-    #     self.T = cam_pose.unsqueeze(0).to("cuda")  # camera-to-world inverse
-    #     return
-
     def set_camera_viewpoint(self, x=0, y=0, z=0, roll=0, pitch=0, yaw=0):
+        self.x, self.y, self.z = x, y, z
+        self.roll, self.pitch, self.yaw = roll, pitch, yaw
 
-        # set camera pose
+        # Rotation: world→camera or camera→world?
+        # For GSplat we need **camera-to-world**
+        R_mat = R.from_euler('zyx', [roll, pitch, yaw], degrees=True).as_matrix()
 
-        self.x = x
-        self.y = y
-        self.z = z
-        self.roll = roll
-        self.pitch = pitch
-        self.yaw = yaw
-        rot = R.from_euler('zyx', [roll, pitch, yaw], degrees=True)
-        R_mat = rot.as_matrix()          # 3x3
+        T = np.eye(4, dtype=np.float32)
+        T[:3, :3] = R_mat
+        T[:3, 3] = np.array([x, y, z], dtype=np.float32)
 
-
-        camera_pos = np.array([x, y, z])
-        t = np.array(camera_pos, dtype=np.float32).reshape(3, 1)
-
-        np_view = np.eye(4, dtype=np.float32)
-        np_view[0:3, 0:3] = R_mat         # inverse rotation
-
-        np_view[0:3, 3] = np.squeeze(R_mat @ t)     # inverse translation
-
-
-        self.T = torch.from_numpy(np_view).to(dtype=torch.float32).unsqueeze(0).to("cuda")
-
-        return
+        self.T = torch.from_numpy(T).unsqueeze(0).cuda()
 
 
     def rotate_camera(self, roll=0, pitch=0, yaw=0):
@@ -414,6 +376,10 @@ class Camera:
         # print(f"x: {self.x}, y:{self.y}, z:{self.z}")
 
         return
+
+    def print_camera_pose(self):
+        print(f"x: {self.x}, y: {self.y}, z: {self.z}")
+        print(f"roll: {self.roll}, pitch: {self.pitch}, yaw: {self.yaw}")
 
 class GaussianModel:
 
@@ -1219,6 +1185,35 @@ class SPLAT_APP:
 
         return 
 
+    def select_object_interactively(self):
+        
+        rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs, seg_img = self.rasterize_images_and_segment()
+
+        
+        #cv2.resizeWindow("grounded_sam2", 1600, 720)
+        cv2.imshow("grounded_sam2", rgb_vis_3dgs_bgr)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+    def edit_gaussians_main(sh_degree, ply_file_path, out_dir):
+        
+        gaussian_model = GaussianModel(sh_degree, ply_file_path)
+
+        cam = init_cam()
+        
+        #record_mode = Record_Mode.CONTINUE
+        record_mode = Record_Mode.PAUSE
+
+        recorder = Recorder(out_dir, record_mode)
+        
+        splat_app = SPLAT_APP(cam, gaussian_model, recorder)
+
+        # Select Object Interactively
+        splat_app.select_object_interactively()
+
+        # # Walkthrough the splat to assess quality of edit
+        # splat_app.vr_walkthrough_pygame(record_mode)
+        # print("Walk through is done... Replay with noise now....")
 
     def vr_walkthrough_pygame(self, record_mode):
 
@@ -1264,6 +1259,7 @@ class SPLAT_APP:
             self.cam.pygame_move_camera()
 
             pose = self.cam.T.squeeze(0).detach().cpu().numpy().astype(np.float32)
+            self.cam.print_camera_pose()
 
             rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs, seg_img = self.rasterize_images_and_segment()
 
@@ -1778,13 +1774,19 @@ def init_cam():
     # Track position and orientation of the camera over time
     tx, ty, tz, roll, pitch, yaw = 0, 0, 0, 0, 0, 0
 
+    # # Use this initialization for the VR app (Ground floor origin near stairs)
+    # tx, ty, tz = 2, -1, 1
+    # roll, pitch, yaw = 0, 180, -90
 
-    tx, ty, tz = 2, -1, 1
-    roll, pitch, yaw = 0, 180, -90
-
-    # Use this initialization for the VR app (first floor origin near stairs)
+    # # Use this initialization for the VR app (first floor origin near stairs)
     # tx, ty, tz = -2.3, -0.08, 4.09 
     # roll, pitch, yaw = 0, -90, -90
+
+
+    # Use this initialization for the VR app (first floor ARTLABS)
+    tx, ty, tz = -25.3, -0.08, 5.09 
+    roll, pitch, yaw = 0, -180, -90
+
     cam.set_camera_viewpoint(tx, ty, tz, roll, pitch, yaw)
 
     return cam
@@ -1939,6 +1941,26 @@ def encode_feature_maps(model, feature_dir, latent_dim):
     print(f"✅ Encoded latent features saved to {latent_dir}")
 
 
+def edit_gaussians_main(sh_degree, ply_file_path, out_dir):
+    
+    gaussian_model = GaussianModel(sh_degree, ply_file_path)
+
+    cam = init_cam()
+    
+    #record_mode = Record_Mode.CONTINUE
+    record_mode = Record_Mode.PAUSE
+
+    recorder = Recorder(out_dir, record_mode)
+    
+    splat_app = SPLAT_APP(cam, gaussian_model, recorder)
+
+    # Select Object Interactively
+    splat_app.select_object_interactively()
+
+    # # Walkthrough the splat to assess quality of edit
+    # splat_app.vr_walkthrough_pygame(record_mode)
+    # print("Walk through is done... Replay with noise now....")
+
 
 def main():
 
@@ -1948,7 +1970,7 @@ def main():
     sh_degree = 3
     #ply_file_path="/root/code/datasets/xgrids/LCC_output/AG_Office/ply-result/point_cloud/iteration_100/point_cloud.ply"
     ply_file_path="/root/code/ubuntu_data/datasets/ARTGarage/lab_office_in_out_k1_scanner/output/LCC_Studio_GaussianSplat_out/AG_Office/ply-result/point_cloud/iteration_100/point_cloud.ply"
-    ply_file_path="/root/code/ubuntu_data/datasets/ARTGarage/ARTLabs/output/ply-result/point_cloud/iteration_100/point_cloud.ply"
+    #ply_file_path="/root/code/ubuntu_data/datasets/ARTGarage/ARTLabs/output/ply-result/point_cloud/iteration_100/point_cloud.ply"
 
 
     # sh_degree = 3
@@ -1959,16 +1981,19 @@ def main():
 
     out_dir = Path("/root/code/output/segmentation_testing/")
 
-
     # First perform VR walk through (disable segmentation inside vr walkthrough rasterizer as well) and record a trajectory
     # Then run calculate gaussian feature field for segmenting the images recorded
     # Disable feature field calculation when segmentation is being run if you want
     # Run AnyLabel to improve annotation performance
     # Enable feature field calculation if you want to lift the segmentation into the Gaussians via backpropagation
+
     if 1:
         splat_app_main(sh_degree, ply_file_path, out_dir)
     else:
         calculate_gaussian_feature_field_main(sh_degree, ply_file_path, out_dir)
+
+
+    # edit_gaussians_main(sh_degree, ply_file_path, out_dir)
 
 
 if __name__ == "__main__":
