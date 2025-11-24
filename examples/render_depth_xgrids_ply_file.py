@@ -519,7 +519,7 @@ class GaussianModel:
             Ks=Ks,  # [C, 3, 3]
             width=width,
             height=height,
-            packed=False,
+            packed=True,
             absgrad=False,
             sparse_grad=False,
             rasterize_mode=rasterize_mode,
@@ -1038,7 +1038,7 @@ class SPLAT_APP:
 
         # 3DGS Renderings
         sh_degree = self.gaussian_model._sh_degree
-        renders, alphas, info = self.gaussian_model.rasterize_splats(
+        renders, alphas, self._last_meta = self.gaussian_model.rasterize_splats(
             camtoworlds=self.cam.T,
             Ks=self.cam.Ks,
             width=self.cam.W,
@@ -1051,6 +1051,8 @@ class SPLAT_APP:
             masks=masks,
         )
         colors, depths = renders[..., 0:3], renders[..., 3:4]
+
+        print(self._last_meta.keys())
 
 
         return colors, depths
@@ -1076,6 +1078,15 @@ class SPLAT_APP:
 
 
         return rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs
+
+    def restore_original_gaussians(self):
+
+        self.gaussian_model._xyz         = self.original_gaussians["_xyz"].clone()
+        self.gaussian_model._rotation    = self.original_gaussians["_rotation"].clone()
+        self.gaussian_model._scaling     = self.original_gaussians["_scaling"].clone()
+        self.gaussian_model._opacity     = self.original_gaussians["_opacity"].clone()
+        self.gaussian_model._features_dc = self.original_gaussians["_features_dc"].clone()
+        self.gaussian_model._features_rest = self.original_gaussians["_features_rest"].clone()
 
 
     def transfer_saved_features_to_splat(self, input_dir):
@@ -1211,7 +1222,7 @@ class SPLAT_APP:
         viewmats = torch.linalg.inv(self.cam.T.detach())  # [1, 4, 4]
 
         # Rasterize with dummy scalar colors
-        render_scalar, _, _ = rasterization(
+        colors, alphas, meta = rasterization(
             means=self.gaussian_model._xyz.detach(),
             quats=self.gaussian_model._rotation.detach(),
             scales=torch.exp(self.gaussian_model._scaling.detach()),
@@ -1221,14 +1232,14 @@ class SPLAT_APP:
             Ks=self.cam.Ks.detach(),                    # [1, 3, 3]
             width=W,
             height=H,
-        )  # render_scalar: [1, H, W, 1]
+        )  # colors: [1, H, W, 1]
 
         # Convert mask to torch and apply to rendered scalar
         mask_t = torch.from_numpy(mask_np.astype(np.float32)).to(device=device)
         mask_t = mask_t.view(H, W, 1)  # [H, W, 1]
 
         # Sum over masked pixels → scalar
-        target = (render_scalar[0] * mask_t).sum()
+        target = (colors[0] * mask_t).sum()
         target.backward()
 
         # Gradient w.r.t. per-Gaussian scalar tells you which Gaussians contributed
@@ -1260,14 +1271,258 @@ class SPLAT_APP:
             mask_overlay = mask_overlay.squeeze()
         mask_overlay = (mask_overlay > 0).astype(np.uint8)
 
+        dist = cv2.distanceTransform(mask_overlay.astype(np.uint8), cv2.DIST_L2, 5)
+        norm_dist = dist / dist.max()     # normalize 0–1
+
+        if 1:
+            mask_clean = norm_dist * mask_overlay
+        elif 0:
+            mask_clean = (dist > 2).astype(np.uint8)     # keep pixels that are >2 px inside
+        else:
+            mask_clean = mask_overlay
+
         # Map 2D mask → Gaussians
-        gaussian_idx = self.mask_to_gaussian_indices(mask_overlay, min_grad=1e-5)
+        gaussian_idx = self.mask_to_gaussian_indices(mask_clean, min_grad=1e-5)
 
         # Store for later editing
         self.selected_gaussians = gaussian_idx
         print(f"🎯 Stored {len(gaussian_idx)} selected Gaussians in self.selected_gaussians")
 
         return gaussian_idx
+
+
+    def select_object_interactively_v2(self):
+
+        """
+        Interactive SAM2 segmentation using positive/negative clicks.
+
+        Controls:
+            Left-click  = positive prompt
+            Right-click = negative prompt
+            ENTER       = finalize and return mask
+            r           = reset all points
+            q           = quit (returns None)
+        """
+
+
+        device="cuda"
+        dtype=torch.bfloat16
+
+        sam_window_name = "Interactive SAM2 Segmentation"
+        cv2.namedWindow(sam_window_name, cv2.WINDOW_NORMAL)
+        edited_gaussian_window_name = "Interactive SAM2 Segmentation"
+        cv2.namedWindow(edited_gaussian_window_name, cv2.WINDOW_NORMAL)
+
+        image_rgb, _, _, _ = self.rasterize_images()
+
+        H, W, _ = image_rgb.shape
+
+        img_disp = image_rgb.copy()
+        pos_points = []
+        neg_points = []
+        mask_overlay = None
+
+        # ---- wrapper so callback has correct scope ----
+        def callback(event, x, y, flags, param):
+            nonlocal pos_points, neg_points, mask_overlay, img_disp
+
+            if event == cv2.EVENT_LBUTTONDOWN:
+                pos_points.append((x, y))
+            elif event == cv2.EVENT_RBUTTONDOWN:
+                neg_points.append((x, y))
+            else:
+                return
+
+            # --- run SAM with updated points ---
+            mask_overlay = self.run_sam2_points(
+                image_rgb=image_rgb,
+                pos_points=pos_points,
+                neg_points=neg_points,
+                device=device,
+                dtype=dtype
+            )
+
+            # --- redraw ---
+            img_disp = self.draw_interaction(
+                image_rgb=image_rgb,
+                pos_points=pos_points,
+                neg_points=neg_points,
+                mask_overlay=mask_overlay
+            )
+
+        cv2.setMouseCallback(sam_window_name, callback)
+
+        # === main loop ===
+        while True:
+            cv2.imshow(sam_window_name, img_disp)
+            key = cv2.waitKey(20)
+
+            if key == 13:  # ENTER
+                cv2.destroyWindow(sam_window_name)
+
+                if mask_overlay is None:
+                    print("⚠️ No mask selected (user quit).")
+                else:
+                    # Make sure mask is H x W uint8
+                    if mask_overlay.ndim == 3:
+                        mask_overlay = mask_overlay.squeeze()
+                    obj_mask_overlay = (mask_overlay > 0).astype(np.uint8)
+
+
+                    obj_selected_gaussians = self.select_gaussians_via_2d_conics(obj_mask_overlay)
+
+
+                    # bg_mask_overlay = (1 - obj_mask_overlay).astype(np.uint8)
+
+                    # # Map 2D mask → Gaussians
+                    # obj_selected_gaussians = self.mask_to_gaussian_indices(obj_mask_overlay, min_grad=1e-5)
+                    # bg_selected_gaussians = self.mask_to_gaussian_indices(bg_mask_overlay, min_grad=1e-5)
+                    # self.selected_gaussians = bg_selected_gaussians
+
+
+                    self.selected_gaussians = obj_selected_gaussians
+                    
+
+                    # Edit Gaussians
+                    #self.highlight_gaussians()
+                    #self.highlight_dominant_gaussian()
+                    self.remove_gaussians()
+                    #self.remove_dominant_gaussian()
+
+                    # Rasterize and Display to user
+                    rgb_bgr, _, _, _ = self.rasterize_images()
+                    cv2.putText(rgb_bgr, f"Found {len(self.selected_gaussians)} Gaussians contributing to that pixel.", (100, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+                    cv2.imshow(edited_gaussian_window_name, rgb_bgr)
+                    key = cv2.waitKey(0)
+                    cv2.destroyWindow(edited_gaussian_window_name)
+            elif key == ord('r'):
+
+                # Restore Original Gaussians
+                self.restore_original_gaussians()
+                image_rgb, _, _, _ = self.rasterize_images()
+
+                # Reset
+                pos_points = []
+                neg_points = []
+                mask_overlay = None
+                img_disp = image_rgb.copy()
+                cv2.imshow(edited_gaussian_window_name, image_rgb)
+
+            elif key == ord('q'):
+                cv2.destroyWindow(sam_window_name)
+                return
+
+
+    def select_gaussians_via_2d_conics(self, object_mask, k=2.0):
+        """
+        object_mask: HxW uint8 array from SAM
+        k: ellipse cov scaling (2.0 = 95% Gaussian influence)
+        """
+
+        # Generate background mask
+        background_mask = (1 - object_mask).astype(np.uint8)
+
+        # --- Render to get gsplat meta information ---
+        rgb, rgb_linear, depth, depth_vis = self.rasterize_images()
+        meta = self._last_meta   # store meta from rasterizer
+
+        means2d = meta["means2d"].detach().cpu().numpy()          # [M,2]
+        conics  = meta["conics"].detach().cpu().numpy()           # [M,3]
+        ids     = meta["gaussian_ids"].detach().cpu().numpy()     # [M]
+
+        H, W = object_mask.shape
+
+        object_gaussians = []
+        background_gaussians = []
+
+        print("🔍 Checking 2D conic overlaps for all visible Gaussians...")
+
+        for i in range(len(ids)):
+            u, v = means2d[i]
+
+            # Skip off-screen or invalid projections
+            if not (0 <= u < W and 0 <= v < H):
+                continue
+
+            ellipse_pts = self.sample_conic_ellipse(conics[i], (u, v), k=k)
+
+            in_obj = self.ellipse_overlaps_mask(ellipse_pts, object_mask)
+            in_bg  = self.ellipse_overlaps_mask(ellipse_pts, background_mask)
+
+            gauss_id = ids[i]
+
+            if in_obj:
+                object_gaussians.append(gauss_id)
+
+            if in_bg:
+                background_gaussians.append(gauss_id)
+
+        object_gaussians = set(object_gaussians)
+        background_gaussians = set(background_gaussians)
+
+        # Remove ONLY pure object Gaussians
+        removable = np.array(list(object_gaussians - background_gaussians), dtype=np.int32)
+
+        print(f"🎯 Object Gaussians: {len(object_gaussians)}")
+        print(f"🎯 Background Gaussians: {len(background_gaussians)}")
+        print(f"🔥 Removable Gaussians: {len(removable)}")
+
+        return removable
+
+    def ellipse_overlaps_mask(self, ellipse_pts, mask):
+        """
+        ellipse_pts: Nx2 float coordinates
+        mask: HxW uint8 mask
+        """
+        H, W = mask.shape
+
+        pts = np.round(ellipse_pts).astype(int)
+
+        valid = (pts[:, 0] >= 0) & (pts[:, 0] < W) & \
+                (pts[:, 1] >= 0) & (pts[:, 1] < H)
+        pts = pts[valid]
+
+        if len(pts) == 0:
+            return False
+
+        return np.any(mask[pts[:, 1], pts[:, 0]] > 0)
+
+
+    def sample_conic_ellipse(self, conic, center, num_samples=40, k=2.0):
+        """
+        conic: [A, B, C] defining ellipse A dx^2 + B dx dy + C dy^2 = 1
+        center: (u, v)
+        Returns Nx2 array of (x, y) sample points along ellipse boundary.
+        """
+
+        A, B, C = conic
+        # Conic matrix (inverse covariance)
+        Q = np.array([[A, B/2],
+                      [B/2, C]])
+
+        # Covariance = inverse of Q
+        cov2d = np.linalg.inv(Q)
+
+        # Eigen decomposition
+        vals, vecs = np.linalg.eigh(cov2d)
+
+        # Radii along principal axes
+        rx = k * np.sqrt(vals[0])
+        ry = k * np.sqrt(vals[1])
+
+        # Parametric ellipse
+        theta = np.linspace(0, 2*np.pi, num_samples)
+        circle = np.stack([rx*np.cos(theta), ry*np.sin(theta)], axis=1)  # Nx2
+
+        # Rotate by eigenvectors
+        ellipse = circle @ vecs.T
+
+        # Shift to pixel center
+        ellipse[:, 0] += center[0]
+        ellipse[:, 1] += center[1]
+
+        return ellipse
+
 
     def remove_selected_gaussians(self):
         """
@@ -1401,72 +1656,6 @@ class SPLAT_APP:
         cv2.destroyAllWindows()
 
         print("✅ Rendered original vs edited comparison.")
-
-
-
-
-    # def debug_render_selected_gaussians(self):
-    #     """
-    #     Debug visualization:
-    #     - Render only the selected gaussians
-    #     - Render only the complement
-    #     Displays two windows:
-    #         1) "Selected Gaussians"
-    #         2) "Complement Gaussians"
-    #     """
-
-    #     if not hasattr(self, "selected_gaussians"):
-    #         print("⚠️ No selected_gaussians found. Run select_object_interactively() first.")
-    #         return
-
-    #     idx_np = self.selected_gaussians
-    #     idx = torch.from_numpy(idx_np).to("cuda")
-
-    #     N = self.gaussian_model._xyz.shape[0]
-    #     mask = torch.zeros(N, device="cuda", dtype=torch.bool)
-    #     mask[idx] = True
-
-    #     # Save original opacity
-    #     with torch.no_grad():
-    #         original_opacity = self.gaussian_model._opacity.clone()
-
-    #     # --------------------
-    #     # 1) Render SELECTED ONLY
-    #     # --------------------
-    #     with torch.no_grad():
-    #         self.gaussian_model._opacity.copy_(original_opacity)
-    #         self.gaussian_model._opacity[~mask] = -10.0  # hide others
-
-    #     rgb_selected, _, _, _ = self.rasterize_images()
-
-    #     # --------------------
-    #     # 2) Render COMPLEMENT ONLY
-    #     # --------------------
-    #     with torch.no_grad():
-    #         self.gaussian_model._opacity.copy_(original_opacity)
-    #         self.gaussian_model._opacity[mask] = -10.0  # hide selected
-
-    #     rgb_complement, _, _, _ = self.rasterize_images()
-
-    #     # --------------------
-    #     # Restore original opacity
-    #     # --------------------
-    #     with torch.no_grad():
-    #         self.gaussian_model._opacity.copy_(original_opacity)
-
-    #     # --------------------
-    #     # Display side-by-side
-    #     # --------------------
-    #     cv2.namedWindow("Selected Gaussians", cv2.WINDOW_NORMAL)
-    #     cv2.imshow("Selected Gaussians", rgb_selected)
-
-    #     cv2.namedWindow("Complement Gaussians", cv2.WINDOW_NORMAL)
-    #     cv2.imshow("Complement Gaussians", rgb_complement)
-
-    #     print(f"🎯 Debug render: selected {idx.numel()} gaussians, complement {N - idx.numel()}.")
-
-    #     cv2.waitKey(0)
-    #     cv2.destroyAllWindows()
 
 
     def interactive_sam2_segmentation(self, image_rgb, device="cuda", dtype=torch.bfloat16):
@@ -1607,7 +1796,94 @@ class SPLAT_APP:
             masked[mask_overlay > 0] = (0, 255, 0)
             overlay = cv2.addWeighted(overlay, 1.0, masked, 0.4, 0)
 
+            masked = np.zeros_like(overlay)
+            masked[mask_overlay <= 0] = (255, 0, 0)
+            overlay = cv2.addWeighted(overlay, 1.0, masked, 0.4, 0)
+
         return overlay
+
+    def select_pixel_interactively(self):
+        """
+        Opens a window where the user clicks on a pixel.
+        Returns (x, y) pixel coordinates.
+        """
+        # Render the scene
+        rgb_bgr, rgb, rendered_depth, depth_vis = self.rasterize_images()
+        self._last_render = rgb_bgr  # store for use in callback
+
+        window_name = "click_pixel"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.imshow(window_name, rgb_bgr)
+
+        # Mouse callback
+        def mouse_callback(event, x, y, flags, param):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                print(f"🖱️  Pixel selected: ({x}, {y})")
+                gaussians = self.select_gaussians_at_pixel(x, y)
+                # Store them for editing
+                self.selected_gaussians = gaussians
+                #self.highlight_gaussians()
+                #self.highlight_dominant_gaussian()
+                self.remove_gaussians()
+                #self.remove_dominant_gaussian()
+                rgb_bgr, rgb, rendered_depth, depth_vis = self.rasterize_images()
+                cv2.putText(rgb_bgr, f"Found {len(gaussians)} Gaussians contributing to that pixel.", (100, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+                cv2.imshow(window_name, rgb_bgr)
+
+        cv2.setMouseCallback(window_name, mouse_callback)
+
+        # === main loop ===
+        while True:
+            key = cv2.waitKey(20)
+
+            if key == 13:  # ENTER
+                cv2.destroyWindow(window_name)
+                return
+
+            elif key == ord('q'):
+                cv2.destroyWindow(window_name)
+                return
+            else:
+                continue
+
+        return
+
+
+    def select_gaussians_at_pixel(self, x, y, min_grad=1e-6):
+        """
+        Runs gradient-based Gaussian selection at a single pixel (x,y).
+        Returns Gaussian indices.
+        """
+        H, W = self._last_render.shape[:2]
+
+        # 1-pixel mask
+        mask = np.zeros((H, W), dtype=np.uint8)
+        mask[y, x] = 1
+
+        print("🎯 Running mask_to_gaussian_indices on single pixel...")
+        selected = self.mask_to_gaussian_indices(mask, min_grad=min_grad)
+
+        print(f"✔ Found {len(selected)} Gaussians contributing to that pixel.")
+        return selected
+
+
+    def highlight_gaussians(self):
+        with torch.no_grad():
+            self.gaussian_model._features_dc[self.selected_gaussians] = torch.tensor([1.0, 0.0, 0.0], device="cuda")
+            self.gaussian_model._opacity[self.selected_gaussians] = 5.0
+
+    def highlight_dominant_gaussian(self):
+        with torch.no_grad():
+            self.gaussian_model._features_dc[self.selected_gaussians[0]] = torch.tensor([1.0, 0.0, 0.0], device="cuda")
+            self.gaussian_model._opacity[self.selected_gaussians[0]] = 5.0
+
+    def remove_gaussians(self):
+        with torch.no_grad():
+            self.gaussian_model._opacity[self.selected_gaussians] = -10.0
+
+    def remove_dominant_gaussian(self):
+        with torch.no_grad():
+            self.gaussian_model._opacity[self.selected_gaussians[0]] = -10.0
 
     def vr_walkthrough_pygame(self, record_mode):
 
@@ -1816,29 +2092,6 @@ class SPLAT_APP:
             raise ValueError("Unsupported file type")
         return poses
 
-    # def replay_from_training_poses(self, gaussian_model, pose_file, out_dir="train_replay",
-    #                                file_type="csv", trans_noise=0.05, rot_noise_deg=2.0):
-
-
-
-    #     poses = load_training_poses(pose_file, file_type)
-
-
-    #     for frame_id, pose in poses.items():
-    #         noisy_pose = perturb_pose(pose, trans_noise, rot_noise_deg)
-
-    #         cam.T = torch.from_numpy(noisy_pose).unsqueeze(0).cuda()
-    #         colors, depths = rasterize_rgbd(cam, gaussian_model)
-
-    #         rendered_rgb = (colors[0].clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
-    #         rendered_depth = depths[0].squeeze(2).cpu().numpy()
-    #         norm_depth = normalize_depth(rendered_depth, rendered_depth.min(), rendered_depth.max())
-
-    #         recorder.record(rendered_rgb, rendered_depth, norm_depth, pose, noisy_pose)
-
-    #     recorder.save_json()
-    #     print(f"✅ Training pose replay (with noise) saved to {out_dir}")
-
 
 def render_rgbd_from_obj(cam, obj_path):
     mesh = o3d.io.read_triangle_mesh(obj_path)
@@ -1871,289 +2124,6 @@ def render_rgbd_from_obj(cam, obj_path):
     depth_np = np.asarray(depth)
 
     return color_np, depth_np
-
-
-
-def render_xgrids_pose_file(gaussian_model, render_video=False):
-
-    # Initialize Camera
-    H = 1080
-    W = 1920
-    fx = fy = 1080
-    cam = Camera(H, W, fx, fy)
-
-    # Load trajectory
-    pose_file =  "img_traj.csv" # "panoramicPoses.csv" "img_traj.csv" "poses.csv"
-
-    img_traj_path = f"/root/code/datasets/ARTGarage/xgrids/1/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/{pose_file}"
-    df = pd.read_csv(img_traj_path, comment="#", sep='\s+',
-                 names=["timestamp", "imgname", "tx", "ty", "tz", "qx", "qy", "qz", "qw"])
-
-    # df = pd.read_csv(img_traj_path, comment="#", sep='\s+',
-    #              names=["timestamp", "tx", "ty", "tz", "qx", "qy", "qz", "qw"])
-
-
-    if render_video:
-
-        # Define output path
-        video_path = "/root/code/datasets/ARTGarage/xgrids/rendered_comparison.mp4"
-
-        # Define video writer (assumes 1920x1080 images → adjust if needed)
-        frame_h, frame_w = H, W
-        output_size = (frame_w * 2, frame_h * 2)  # side-by-side: RGB | Depth
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        fps=0.5
-        video_writer = cv2.VideoWriter(video_path, fourcc, fps, output_size)
-    else:
-        display_w, display_h = W, H
-        tile_w, tile_h = display_w // 2, display_h // 2
-
-    for idx, row in df.iterrows():
-        # if idx > 30:
-        #     break
-
-        # imgname = row["imgname"][:-4]
-        # img_path = f"/root/code/datasets/ARTGarage/xgrids/1/ResultDataArtGarage_sample_2025-07-17-121502_0/ArtGarage_sample_2025-07-17-121502/perspective/images/{imgname}_2.jpg"
-        # gt_img = cv2.imread(img_path)
-        # gt_img_rgb = cv2.cvtColor(gt_img, cv2.COLOR_BGR2RGB)
-        # gt_tensor = ToTensor()(gt_img_rgb).permute(1, 2, 0).unsqueeze(0).to("cuda")  # [1, H, W, 3]
-
-        # Set Camera Viewpoint
-        cam.set_camera_viewpoint(row.tx, row.ty, row.tz, row.qx, row.qy, row.qz, row.qw)
-
-        colors, depths = rasterize_rgbd(cam, gaussian_model)
-
-        # # Convert to CPU and numpy
-        rendered_rgb_3dgs = colors[0].clamp(0, 1).detach().cpu().numpy()  # [H, W, 3]
-        rendered_depth_3dgs = depths[0].squeeze(2).detach().cpu().numpy()  # [H, W]
-
-        # === Convert to displayable format ===
-        rgb_vis_3dgs = (rendered_rgb_3dgs * 255).astype(np.uint8)
-        rgb_vis_3dgs = cv2.cvtColor(rgb_vis_3dgs, cv2.COLOR_RGB2BGR)
-        depth_min = rendered_depth_3dgs.min()
-        depth_max = rendered_depth_3dgs.max()
-        depth_vis_3dgs = normalize_depth(rendered_depth_3dgs, depth_min, depth_max)
-        
-
-        # OBJ File Renderings
-        obj_file = "/root/code/datasets/ARTGarage/xgrids/4/Gaussian/Mesh_Files/art_garage_sample.obj"
-        #obj_file = "/root/code/datasets/ARTGarage/xgrids/4/Mesh_textured/texture/block0.obj"
-
-        rgb_obj, depth_obj = render_rgbd_from_obj(cam, obj_file)
-    
-        # Ensure OBJ RGB is BGR
-        rgb_vis_obj = cv2.cvtColor(rgb_obj, cv2.COLOR_RGB2BGR)
-        # Normalize OBJ depth for visualization
-        depth_vis_obj = normalize_depth(depth_obj, depth_min, depth_max)
-
-
-        if render_video:
-
-            cv2.putText(rgb_vis_3dgs, "GS RGB", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
-            cv2.putText(rgb_vis_obj,  "OBJ RGB", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
-            cv2.putText(depth_vis_3dgs, "GS Depth", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
-            cv2.putText(depth_vis_obj,  "OBJ Depth", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
-
-            # Top row: RGB images
-            top_row = np.hstack([rgb_vis_3dgs, rgb_vis_obj])
-
-            # Bottom row: Depth images
-            bottom_row = np.hstack([depth_vis_3dgs, depth_vis_obj])
-
-            # Final 2x2 grid
-            grid_frame = np.vstack([top_row, bottom_row])  # [2H, 2W, 3]
-
-            video_writer.write(grid_frame)
-        else:
-
-            rgb1 = cv2.resize(rgb_vis_3dgs, (tile_w, tile_h))
-            rgb2 = cv2.resize(rgb_vis_obj, (tile_w, tile_h))
-            depth1 = cv2.resize(depth_vis_3dgs, (tile_w, tile_h))
-            depth2 = cv2.resize(depth_vis_obj, (tile_w, tile_h))
-
-            depth_3dgs_rescale = cv2.resize(rendered_depth_3dgs, (tile_w, tile_h))
-            depth_obj_rescale = cv2.resize(depth_obj, (tile_w, tile_h))
-
-            cv2.putText(rgb1, "GS RGB", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-            cv2.putText(rgb2, "OBJ RGB", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-            cv2.putText(depth1, "GS Depth", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-            cv2.putText(depth2, "OBJ Depth", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-
-            top = np.hstack([rgb1, rgb2])
-            bottom = np.hstack([depth1, depth2])
-            grid = np.vstack([top, bottom])  # final shape: (1080, 1920, 3)
-
-            cv2.namedWindow("Renderings", cv2.WINDOW_NORMAL)
-            cv2.imshow("Renderings", grid)
-            cv2.resizeWindow("Renderings", display_w, display_h)
-            cv2.setMouseCallback("Renderings", quadrant_callback, param=(rgb1, rgb2, depth1, depth2, depth_3dgs_rescale, depth_obj_rescale))
-
-
-            # # Add windows and mouse callback
-            # cv2.namedWindow("GS RGB")
-            # cv2.setMouseCallback("GS RGB", on_mouse_click, param=("GS RGB", rgb_vis_3dgs, rendered_depth_3dgs))
-            # cv2.imshow("GS RGB", rgb_vis_3dgs)
-
-            # cv2.namedWindow("GS Depth")
-            # cv2.setMouseCallback("GS Depth", on_mouse_click, param=("GS Depth", depth_vis_3dgs, rendered_depth_3dgs))
-            # cv2.imshow("GS Depth", depth_vis_3dgs)
-
-            # cv2.namedWindow("OBJ RGB")
-            # cv2.setMouseCallback("OBJ RGB", on_mouse_click, param=("OBJ RGB", rgb_vis_3dgs, depth_obj))
-            # cv2.imshow("OBJ RGB", rgb_vis_3dgs)
-
-            # cv2.namedWindow("OBJ Depth")
-            # cv2.setMouseCallback("OBJ Depth", on_mouse_click, param=("OBJ Depth", depth_vis_obj, depth_obj))
-            # cv2.imshow("OBJ Depth", depth_vis_obj)
-
-            print("🔍 Click on any window to annotate pixel values. Press any key to move to the next frame.")
-            key = cv2.waitKey(0)
-            if key in [27, ord('q')]:  # ESC or 'q'
-                print("🛑 Exiting...")
-                break
-
-    if render_video:
-
-        video_writer.release()
-        print(f"✅ Video saved at: {video_path}")
-    else:
-        cv2.destroyAllWindows()
-
-
-def vr_walkthrough_opencv(gaussian_model):
-
-    def on_mouse_click1(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            window, img, depth = param  # Unpack color/depth flag
-            val = depth[y, x]
-            text = f"({x}, {y}): {val:.3f}"
-            cv2.putText(img, text, (x+10, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
-            cv2.imshow(window, img)
-
-    def quadrant_callback1(event, x, y, flags, param):
-        rgb, depth, rendered_depth_3dgs = param
-        h, w, _ = rgb.shape
-        if y < h:
-            on_mouse_click1(event, x, y, flags, ("Renderings", rgb, rendered_depth_3dgs))
-        elif y >= h:
-            on_mouse_click1(event, x, y - h, flags, ("Renderings", depth, rendered_depth_3dgs))
-
-        # re-render grid with updated images
-        grid = np.vstack([rgb, depth])
-        cv2.imshow("Renderings", grid)
-
-
-    # Initialize Camera
-    H = 1080
-    W = 1920
-    fx = fy = 1080
-    cam = Camera(H, W, fx, fy)
-    near_plane, far_plane = 0.001, 30.0
-    display_w, display_h = W, H
-    tile_w, tile_h = display_w, display_h // 2
-
-    # Track position and orientation of the camera over time
-    tx, ty, tz, roll, pitch, yaw = 0, 0, 0, 0, 0, 0
-    cam.set_camera_viewpoint(tx, ty, tz, roll, pitch, yaw)
-
-    rgb_folder_path = "/root/code/output/gaussian_splatting/xgrids_vr1/color"
-    depth_folder_path = "/root/code/output/gaussian_splatting/xgrids_vr1/depth"
-    json_path="/root/code/output/gaussian_splatting/xgrids_vr1/poses.json"
-
-
-    # --- Main loop ---
-    cv2.namedWindow("View", cv2.WINDOW_NORMAL)
-    print("Click on any window to annotate pixel values. Use keyboard to move around in the environment.")
-    while True:
-        # === Call the Gaussian Rasterizer ===
-        colors, depths = rasterize_rgbd(cam, gaussian_model, near_plane, far_plane)
-
-        # # Convert to CPU and numpy
-        rendered_rgb_3dgs = colors[0].clamp(0, 1).detach().cpu().numpy()  # [H, W, 3]
-        rendered_depth_3dgs = depths[0].squeeze(2).detach().cpu().numpy()  # [H, W]
-
-        # === Convert to displayable format ===
-        rgb_vis_3dgs = (rendered_rgb_3dgs * 255).astype(np.uint8)
-        rgb_vis_3dgs = cv2.cvtColor(rgb_vis_3dgs, cv2.COLOR_RGB2BGR)
-
-        depth_min = near_plane #rendered_depth_3dgs.min()
-        depth_max = far_plane #rendered_depth_3dgs.max()
-        depth_vis_3dgs = normalize_depth(rendered_depth_3dgs, depth_min, depth_max)
-
-        rgb = cv2.resize(rgb_vis_3dgs, (tile_w, tile_h))
-        depth = cv2.resize(depth_vis_3dgs, (tile_w, tile_h))
-
-        cv2.putText(rgb, "GS RGB", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-        cv2.putText(depth, "GS Depth", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-
-        grid = np.vstack([rgb, depth])
-
-        cv2.namedWindow("Renderings", cv2.WINDOW_NORMAL)
-        cv2.imshow("Renderings", grid)
-        cv2.resizeWindow("Renderings", display_w, display_h)
-        cv2.setMouseCallback("Renderings", quadrant_callback1, param=(rgb, depth, rendered_depth_3dgs))
-
-        pose = cam.T.squeeze(0).detach().cpu().numpy().astype(np.float32)
-
-        #recorder.record(rgb_vis_3dgs, depth_vis_3dgs, pose)
-        #cv2.imshow("View", rgb_vis_3dgs)
-
-        
-        key = cv2.waitKey(0)
-        if key == 27 or key == ord('q'):  # ESC or q to quit
-            break
-
-        move_vec=torch.from_numpy(np.zeros(3)).to(dtype=torch.float32).to("cuda")
-        R_mat = cam.T.squeeze(0)[0:3, 0:3]
-        front = -R_mat[:, 2]
-        right = R_mat[:, 0]
-        up = R_mat[:, 1]
-
-        if key == ord('w'):
-            move_vec -= 0.1 * front
-            cam.move_camera(move_vec)
-
-        if key == ord('s'):
-            move_vec += 0.1 * front
-            cam.move_camera(move_vec)
-
-        if key == ord('a'):
-            move_vec -= 0.1 * right
-            cam.move_camera(move_vec)
-
-        if key == ord('d'):
-            move_vec += 0.1 * right
-            cam.move_camera(move_vec)
-
-
-        roll, pitch, yaw = 0, 0, 0
-        # Rotate
-        if key == ord('i'):
-            roll += 1.0
-            cam.rotate_camera(roll, pitch, yaw)
-
-        if key == ord('k'):
-            roll -= 1.0
-            cam.rotate_camera(roll, pitch, yaw)            
-
-        if key == ord('j'):
-            pitch -= 1.0
-            cam.rotate_camera(roll, pitch, yaw)
-
-        if key == ord('l'):
-            pitch += 1.0
-            cam.rotate_camera(roll, pitch, yaw)            
-
-        if key == ord('u'):
-            yaw -= 1.0
-            cam.rotate_camera(roll, pitch, yaw)
-
-        if key == ord('o'):
-            yaw += 1.0
-            cam.rotate_camera(roll, pitch, yaw)
-
-    cv2.destroyAllWindows()
-
 
 def init_cam():
     # Initialize Camera
@@ -2336,6 +2306,7 @@ def encode_feature_maps(model, feature_dir, latent_dim):
     print(f"✅ Encoded latent features saved to {latent_dir}")
 
 
+
 def edit_gaussians_main(sh_degree, ply_file_path, out_dir):
     
     gaussian_model = GaussianModel(sh_degree, ply_file_path)
@@ -2349,19 +2320,24 @@ def edit_gaussians_main(sh_degree, ply_file_path, out_dir):
     
     splat_app = SPLAT_APP(cam, gaussian_model, recorder)
 
-    # Select Object Interactively
-    splat_app.select_object_interactively()
-
-    # # Remove Selected Gaussians
-    # splat_app.remove_selected_gaussians()
-
-    # Move Selected Gaussians
-    splat_app.shift_selected_gaussians(translation=(1.0, 0.0, 0.5))
-
     
+    if 0:
+        # Select Pixel Interactively
+        splat_app.select_pixel_interactively()
+    else:
+        # Select Object Interactively
+        splat_app.select_object_interactively_v2()
+
+    # if 1:
+    #     # Remove Selected Gaussians
+    #     splat_app.remove_selected_gaussians()
+    # else:
+    #     # Move Selected Gaussians
+    #     splat_app.shift_selected_gaussians(translation=(1.0, 0.0, 0.5))
+
+
     # # Debug render to check editing quality
     # splat_app.debug_render_original_and_edited()
-
 
     # Walkthrough the splat to assess quality of edit
     splat_app.vr_walkthrough_pygame(record_mode)
