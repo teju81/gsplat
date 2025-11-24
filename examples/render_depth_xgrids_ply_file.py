@@ -1052,8 +1052,6 @@ class SPLAT_APP:
         )
         colors, depths = renders[..., 0:3], renders[..., 3:4]
 
-        print(self._last_meta.keys())
-
 
         return colors, depths
 
@@ -1888,6 +1886,7 @@ class SPLAT_APP:
     def vr_walkthrough_pygame(self, record_mode):
 
         pygame.init()
+        pygame.mouse.set_visible(True)
         display_width, display_height = self.cam.W, self.cam.H
         screen = pygame.display.set_mode((display_width, display_height))
         pygame.display.set_caption("Gaussian Splat Viewpoint Control")
@@ -1903,6 +1902,8 @@ class SPLAT_APP:
         running = True
         show_help_menu = False
         screen_capture = False
+        mouse_click_event = False
+        clicked_pixel = None
 
         while running:
             for event in pygame.event.get():
@@ -1921,15 +1922,21 @@ class SPLAT_APP:
                         show_help_menu = not show_help_menu
                     elif event.key == pygame.K_c:
                         screen_capture = True
-
-
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    mouse_click_event = True
+                    x, y = event.pos
+                    print(f"🖱️  Pixel selected: ({x}, {y})")
+                    clicked_pixel = (x, y)
+                    # # --- highlight pixel ---
+                    # highlight = img.copy()
+                    # cv2.circle(highlight, (x, y), 4, (255, 0, 0), -1)
                 # elif event.type == pygame.MOUSEMOTION:
                 #     handle_mouse_input(event)
 
             self.cam.pygame_move_camera()
 
             pose = self.cam.T.squeeze(0).detach().cpu().numpy().astype(np.float32)
-            self.cam.print_camera_pose()
+            # self.cam.print_camera_pose() # If you want to know where you are in the world
 
             rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs = self.rasterize_images()
 
@@ -1956,11 +1963,18 @@ class SPLAT_APP:
                 cv2.putText(rgb_game_img, "JL - Pitch Camera Control", (100, 550), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
                 cv2.putText(rgb_game_img, "UO - Roll Camera Control", (100, 650), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
 
+            if mouse_click_event:
+                cv2.circle(rgb_game_img, clicked_pixel, 4, (255, 0, 0), -1)
+                mouse_click_event = False
+
 
             image_surface = pygame.surfarray.make_surface(rgb_game_img.swapaxes(0, 1))
 
             # Blit the surface to the screen
+            mx, my = pygame.mouse.get_pos()
+            pygame.draw.circle(image_surface, (255, 127, 255), (mx, my), 4)
             screen.blit(image_surface, (0, 0))
+
 
             pygame.display.flip()
             clock.tick(60)
@@ -2126,10 +2140,21 @@ def render_rgbd_from_obj(cam, obj_path):
     return color_np, depth_np
 
 def init_cam():
+
+    # For feature database training
+    # # Initialize Camera
+    # H = 1080
+    # W = 1920
+    # fx = fy = 1080
+    # near_plane, far_plane = 0.001, 100.0
+    # cam = Camera(H, W, fx, fy, near_plane, far_plane)
+
+
+    # For visual inspection and testing
     # Initialize Camera
-    H = 1080
-    W = 1920
-    fx = fy = 1080
+    H = 720
+    W = 1280
+    fx = fy = 912
     near_plane, far_plane = 0.001, 100.0
     cam = Camera(H, W, fx, fy, near_plane, far_plane)
     
@@ -2368,13 +2393,13 @@ def main():
     # Run AnyLabel to improve annotation performance
     # Enable feature field calculation if you want to lift the segmentation into the Gaussians via backpropagation
 
-    # if 1:
-    #     splat_app_main(sh_degree, ply_file_path, out_dir)
-    # else:
-    #     calculate_gaussian_feature_field_main(sh_degree, ply_file_path, out_dir)
+    if 1:
+        splat_app_main(sh_degree, ply_file_path, out_dir)
+    else:
+        calculate_gaussian_feature_field_main(sh_degree, ply_file_path, out_dir)
 
 
-    edit_gaussians_main(sh_degree, ply_file_path, out_dir)
+    # edit_gaussians_main(sh_degree, ply_file_path, out_dir)
 
 
 if __name__ == "__main__":
