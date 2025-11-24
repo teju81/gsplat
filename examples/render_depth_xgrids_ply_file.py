@@ -1370,6 +1370,14 @@ class SPLAT_APP:
                     obj_selected_gaussians = self.select_gaussians_via_2d_conics(obj_mask_overlay)
 
 
+                    #obj_selected_gaussians = self.select_gaussians_via_2d_conics_vectorized(obj_mask_overlay)
+
+
+                    # obj_selected_gaussians = self.select_gaussians_via_2d_conics_gpu(obj_mask_overlay)
+                    
+
+
+
                     # bg_mask_overlay = (1 - obj_mask_overlay).astype(np.uint8)
 
                     # # Map 2D mask → Gaussians
@@ -1382,10 +1390,18 @@ class SPLAT_APP:
                     
 
                     # Edit Gaussians
-                    #self.highlight_gaussians()
+                    #self.highlight_selected_gaussians()
                     #self.highlight_dominant_gaussian()
-                    self.remove_gaussians()
+                    #self.remove_selected_gaussians()
                     #self.remove_dominant_gaussian()
+
+                    for i, gid in enumerate(self.selected_gaussians):
+                        self.remove_gaussian(gid)
+                        # Rasterize and Display to user
+                        rgb_bgr, _, _, _ = self.rasterize_images()
+                        print(f"Removed {i}-th Gaussian and rendering")
+                        cv2.imshow(edited_gaussian_window_name, rgb_bgr)
+                        key = cv2.waitKey(0)
 
                     # Rasterize and Display to user
                     rgb_bgr, _, _, _ = self.rasterize_images()
@@ -1467,6 +1483,213 @@ class SPLAT_APP:
 
         return removable
 
+
+    # def select_gaussians_via_2d_conics_vectorized(self, object_mask, k=2.0, ds=8):
+    #     """
+    #     Fast vectorized version of Gaussian selection using downsampled conics.
+    #     - object_mask: HxW uint8 mask
+    #     - k: scaling factor for ellipse radius (2.0 ≈ 95% Gaussian energy)
+    #     - ds: downsample factor (8–16 recommended)
+    #     """
+
+    #     # Background mask
+    #     background_mask = (1 - object_mask).astype(np.uint8)
+
+    #     # Render to get meta
+    #     _, _, _, _ = self.rasterize_images()
+    #     meta = self._last_meta
+
+    #     means2d = meta["means2d"].detach().cpu().numpy()    # (M,2)
+    #     conics  = meta["conics"].detach().cpu().numpy()     # (M,3)
+    #     ids     = meta["gaussian_ids"].detach().cpu().numpy()  # (M,)
+
+    #     H, W = object_mask.shape
+
+    #     # -----------------------------
+    #     # 1. Downsample masks (huge speed-up)
+    #     # -----------------------------
+    #     Hs, Ws = H // ds, W // ds
+    #     obj_small = cv2.resize(object_mask, (Ws, Hs), interpolation=cv2.INTER_NEAREST)
+    #     bg_small  = 1 - obj_small
+
+    #     # -----------------------------
+    #     # 2. Downsample Gaussian centers
+    #     # -----------------------------
+    #     u = (means2d[:, 0] / ds).astype(np.int32)
+    #     v = (means2d[:, 1] / ds).astype(np.int32)
+
+    #     # clamp out of bounds
+    #     u = np.clip(u, 0, Ws - 1)
+    #     v = np.clip(v, 0, Hs - 1)
+
+    #     # -----------------------------
+    #     # 3. Convert conics → approximate ellipse radii
+    #     # Conic = (A, B, C)
+    #     # We ignore B (xy term) for a very fast approximation
+    #     # ellipse radii ~ k / sqrt([A,C])
+    #     # -----------------------------
+    #     A = conics[:, 0]
+    #     C = conics[:, 2]
+
+    #     # avoid division by zero
+    #     A = np.maximum(A, 1e-6)
+    #     C = np.maximum(C, 1e-6)
+
+    #     rx = k / np.sqrt(A) / ds   # x-radius in small image
+    #     ry = k / np.sqrt(C) / ds   # y-radius in small image
+
+    #     rx = rx.astype(np.int32)
+    #     ry = ry.astype(np.int32)
+
+    #     # -----------------------------
+    #     # 4. Compute bounding boxes in downsampled space
+    #     # -----------------------------
+    #     umin = np.clip(u - rx, 0, Ws - 1)
+    #     umax = np.clip(u + rx, 0, Ws - 1)
+    #     vmin = np.clip(v - ry, 0, Hs - 1)
+    #     vmax = np.clip(v + ry, 0, Hs - 1)
+
+    #     # -----------------------------
+    #     # 5. FAST overlap check using bounding box max test
+    #     # Instead of checking all pixels, we check:
+    #     #    If ANY pixel in the bounding box is object → object_gaussian
+    #     #    If ANY pixel in the bounding box is background → background_gaussian
+    #     # -----------------------------
+
+    #     # Extract region using boolean masks
+    #     obj_hits = (obj_small[vmin, umin] |
+    #                 obj_small[vmin, umax] |
+    #                 obj_small[vmax, umin] |
+    #                 obj_small[vmax, umax])
+
+    #     bg_hits  = (bg_small[vmin, umin] |
+    #                 bg_small[vmin, umax] |
+    #                 bg_small[vmax, umin] |
+    #                 bg_small[vmax, umax])
+
+    #     # -----------------------------
+    #     # 6. Final classification
+    #     # -----------------------------
+    #     object_gaussians     = ids[obj_hits]
+    #     background_gaussians = ids[bg_hits]
+
+    #     removable = np.setdiff1d(object_gaussians, background_gaussians)
+
+    #     print(f"⚡ Visible Gaussians: {len(ids)}")
+    #     print(f"🎯 Object hits (fast): {len(object_gaussians)}")
+    #     print(f"🎯 Background hits (fast): {len(background_gaussians)}")
+    #     print(f"🔥 Removable Gaussians (fast): {len(removable)}")
+
+    #     return removable
+
+    # def select_gaussians_via_2d_conics_gpu(self, object_mask, k=2.0, ds=4):
+    #     """
+    #     Ultra-fast GPU ellipse test.
+    #     object_mask : [H,W] uint8 numpy array from SAM
+    #     k           : conic scaling factor (2.0 recommended)
+    #     ds          : mask downsample factor (4–8 recommended)
+    #     """
+
+    #     device = "cuda"
+
+    #     # ---------------------------------------
+    #     # 1. Get rasterizer metadata
+    #     # ---------------------------------------
+    #     _, _, _, _ = self.rasterize_images()
+    #     meta = self._last_meta
+
+    #     means2d = meta["means2d"].detach().to(device)        # [M,2]
+    #     conics  = meta["conics"].detach().to(device)         # [M,3] (A,B,C)
+    #     ids     = meta["gaussian_ids"].detach().cpu().numpy()
+
+    #     M = means2d.shape[0]
+
+    #     H, W = object_mask.shape
+
+    #     # ---------------------------------------
+    #     # 2. Downsample object mask
+    #     # ---------------------------------------
+    #     obj_small = cv2.resize(object_mask, (W//ds, H//ds), interpolation=cv2.INTER_NEAREST)
+    #     bg_small  = 1 - obj_small
+
+    #     Hs, Ws = obj_small.shape
+
+    #     # torch masks
+    #     obj_t = torch.from_numpy(obj_small).to(device=device, dtype=torch.float32)
+    #     bg_t  = torch.from_numpy(bg_small).to(device=device, dtype=torch.float32)
+
+    #     # ---------------------------------------
+    #     # 3. Downsample Gaussian centers
+    #     # ---------------------------------------
+    #     u = (means2d[:,0] / ds)
+    #     v = (means2d[:,1] / ds)
+
+    #     # clamp
+    #     u = torch.clamp(u, 0, Ws-1)
+    #     v = torch.clamp(v, 0, Hs-1)
+
+    #     # ---------------------------------------
+    #     # 4. Create coordinate grid for mask
+    #     # ---------------------------------------
+    #     ys = torch.arange(0, Hs, device=device).float()
+    #     xs = torch.arange(0, Ws, device=device).float()
+    #     Y, X = torch.meshgrid(ys, xs, indexing='ij')
+
+    #     # Flatten grid for vectorized compute
+    #     Xf = X.reshape(-1)        # [P]
+    #     Yf = Y.reshape(-1)        # [P]
+    #     P  = Xf.shape[0]
+
+    #     # ---------------------------------------
+    #     # 5. For each Gaussian, compute conic inequality over all pixels:
+    #     #
+    #     #   A (x-u)^2 + B (x-u)(y-v) + C (y-v)^2 <= k^2
+    #     #
+    #     # Fully vectorized over (M Gaussians × P pixels)
+    #     # ---------------------------------------
+
+    #     # Expand dims for broadcast
+    #     ux = u[:,None]      # [M,1]
+    #     vy = v[:,None]      # [M,1]
+
+    #     dx = (Xf[None,:] - ux)      # [M,P]
+    #     dy = (Yf[None,:] - vy)      # [M,P]
+
+    #     A = conics[:,0][:,None]     # [M,1]
+    #     B = conics[:,1][:,None]
+    #     C = conics[:,2][:,None]
+
+    #     conic_val = A*dx*dx + B*dx*dy + C*dy*dy    # [M,P]
+
+    #     inside = (conic_val <= k*k)    # [M,P] boolean tensor
+
+    #     # ---------------------------------------
+    #     # 6. Compute overlap with mask
+    #     # ---------------------------------------
+    #     mask_flat_obj = obj_t.reshape(-1) > 0
+    #     mask_flat_bg  = bg_t.reshape(-1) > 0
+
+    #     # For each Gaussian:
+    #     #    does ellipse intersect object? background?
+    #     in_obj = torch.any(inside[:, mask_flat_obj], dim=1)   # [M]
+    #     in_bg  = torch.any(inside[:, mask_flat_bg],  dim=1)   # [M]
+
+    #     # ---------------------------------------
+    #     # 7. Final classification
+    #     # ---------------------------------------
+    #     object_gaussians     = ids[in_obj.cpu().numpy()]
+    #     background_gaussians = ids[in_bg.cpu().numpy()]
+
+    #     removable = np.setdiff1d(object_gaussians, background_gaussians)
+
+    #     print(f"⚡ GPU Gaussians visible: {M}")
+    #     print(f"🎯 Intersect object: {len(object_gaussians)}")
+    #     print(f"🎯 Intersect background: {len(background_gaussians)}")
+    #     print(f"🔥 Removable (GPU-accurate): {len(removable)}")
+
+    #     return removable
+
+
     def ellipse_overlaps_mask(self, ellipse_pts, mask):
         """
         ellipse_pts: Nx2 float coordinates
@@ -1522,32 +1745,32 @@ class SPLAT_APP:
         return ellipse
 
 
-    def remove_selected_gaussians(self):
-        """
-        Remove the Gaussians in `self.selected_gaussians`
-        and update the gaussian_model to contain only the remaining ones.
-        """
+    # def remove_selected_gaussians(self):
+    #     """
+    #     Remove the Gaussians in `self.selected_gaussians`
+    #     and update the gaussian_model to contain only the remaining ones.
+    #     """
 
-        if not hasattr(self, "selected_gaussians"):
-            print("⚠️ No gaussians selected. Run select_object_interactively() first.")
-            return
+    #     if not hasattr(self, "selected_gaussians"):
+    #         print("⚠️ No gaussians selected. Run select_object_interactively() first.")
+    #         return
 
-        remove_idx = torch.from_numpy(self.selected_gaussians).to("cuda")
-        N = self.gaussian_model._xyz.shape[0]
+    #     remove_idx = torch.from_numpy(self.selected_gaussians).to("cuda")
+    #     N = self.gaussian_model._xyz.shape[0]
 
-        mask = torch.ones(N, device="cuda", dtype=torch.bool)
-        mask[remove_idx] = False   # keep everything else
+    #     mask = torch.ones(N, device="cuda", dtype=torch.bool)
+    #     mask[remove_idx] = False   # keep everything else
 
-        print(f"🗑️ Removing {remove_idx.numel()} gaussians, keeping {mask.sum().item()}")
+    #     print(f"🗑️ Removing {remove_idx.numel()} gaussians, keeping {mask.sum().item()}")
 
-        # Update all gaussian attributes
-        with torch.no_grad():
-            self.gaussian_model._xyz        = self.gaussian_model._xyz[mask]
-            self.gaussian_model._rotation   = self.gaussian_model._rotation[mask]
-            self.gaussian_model._scaling    = self.gaussian_model._scaling[mask]
-            self.gaussian_model._opacity    = self.gaussian_model._opacity[mask]
-            self.gaussian_model._features_dc   = self.gaussian_model._features_dc[mask]
-            self.gaussian_model._features_rest = self.gaussian_model._features_rest[mask]
+    #     # Update all gaussian attributes
+    #     with torch.no_grad():
+    #         self.gaussian_model._xyz        = self.gaussian_model._xyz[mask]
+    #         self.gaussian_model._rotation   = self.gaussian_model._rotation[mask]
+    #         self.gaussian_model._scaling    = self.gaussian_model._scaling[mask]
+    #         self.gaussian_model._opacity    = self.gaussian_model._opacity[mask]
+    #         self.gaussian_model._features_dc   = self.gaussian_model._features_dc[mask]
+    #         self.gaussian_model._features_rest = self.gaussian_model._features_rest[mask]
 
 
     def shift_selected_gaussians(self, 
@@ -1865,7 +2088,14 @@ class SPLAT_APP:
         return selected
 
 
-    def highlight_gaussians(self):
+
+    def highlight_gaussian(self, gid):
+        with torch.no_grad():
+            self.gaussian_model._features_dc[gid] = torch.tensor([1.0, 0.0, 0.0], device="cuda")
+            self.gaussian_model._opacity[gid] = 5.0
+
+
+    def highlight_selected_gaussians(self):
         with torch.no_grad():
             self.gaussian_model._features_dc[self.selected_gaussians] = torch.tensor([1.0, 0.0, 0.0], device="cuda")
             self.gaussian_model._opacity[self.selected_gaussians] = 5.0
@@ -1875,7 +2105,11 @@ class SPLAT_APP:
             self.gaussian_model._features_dc[self.selected_gaussians[0]] = torch.tensor([1.0, 0.0, 0.0], device="cuda")
             self.gaussian_model._opacity[self.selected_gaussians[0]] = 5.0
 
-    def remove_gaussians(self):
+    def remove_gaussian(self, gid):
+        with torch.no_grad():
+            self.gaussian_model._opacity[gid] = -10.0
+
+    def remove_selected_gaussians(self):
         with torch.no_grad():
             self.gaussian_model._opacity[self.selected_gaussians] = -10.0
 
@@ -1904,6 +2138,12 @@ class SPLAT_APP:
         screen_capture = False
         mouse_click_event = False
         clicked_pixel = None
+        splat_edit = False
+        execute_gaussian_edit = False
+        pos_points = []
+        neg_points = []
+        device="cuda"
+        dtype=torch.bfloat16
 
         while running:
             for event in pygame.event.get():
@@ -1922,16 +2162,35 @@ class SPLAT_APP:
                         show_help_menu = not show_help_menu
                     elif event.key == pygame.K_c:
                         screen_capture = True
+                    elif event.key == pygame.K_r:
+                        # Restore Original Gaussians
+                        self.restore_original_gaussians()
+                    elif event.key == pygame.K_m:
+                        splat_edit = not splat_edit
+                        pos_points = []
+                        neg_points = []
+                        print(f"🖱️  Splat Edit Mode Toggled. Mode: {splat_edit}")
+                    elif event.key in (pygame.K_KP_ENTER, pygame.K_RETURN):
+                        execute_gaussian_edit = True
+
+
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     mouse_click_event = True
                     x, y = event.pos
                     print(f"🖱️  Pixel selected: ({x}, {y})")
                     clicked_pixel = (x, y)
-                    # # --- highlight pixel ---
-                    # highlight = img.copy()
-                    # cv2.circle(highlight, (x, y), 4, (255, 0, 0), -1)
+                    if splat_edit:
+                        if event.button == 1: # Left Click
+                            pos_points.append(clicked_pixel)
+                        elif event.button == 3: #Right click
+                            neg_points.append(clicked_pixel)
+                        print(f"🖱️  Pose Points: {pos_points}, Negative Points: {neg_points}")
+
+
                 # elif event.type == pygame.MOUSEMOTION:
                 #     handle_mouse_input(event)
+
+
 
             self.cam.pygame_move_camera()
 
@@ -1954,14 +2213,71 @@ class SPLAT_APP:
             # NumPy is (height, width, channels), Pygame is (width, height, channels).
 
             rgb_game_img = rgb_vis_3dgs.copy()
+            if splat_edit:
+                # --- run SAM with updated points ---
+                mask_overlay = self.run_sam2_points(
+                    image_rgb=rgb_game_img,
+                    pos_points=pos_points,
+                    neg_points=neg_points,
+                    device=device,
+                    dtype=dtype
+                )
+
+                # --- redraw ---
+                rgb_game_img = self.draw_interaction(
+                    image_rgb=rgb_game_img,
+                    pos_points=pos_points,
+                    neg_points=neg_points,
+                    mask_overlay=mask_overlay
+                )
+
+                if execute_gaussian_edit:
+                    print("Executing Splat Edit....")
+                    splat_edit = False
+                    pos_points = []
+                    neg_points = []
+                    print(f"🖱️  Splat Edit Mode Toggled. Mode: {splat_edit}")                    
+
+
+                    # Make sure mask is H x W uint8
+                    if mask_overlay.ndim == 3:
+                        mask_overlay = mask_overlay.squeeze()
+                    obj_mask_overlay = (mask_overlay > 0).astype(np.uint8)
+                    # bg_mask_overlay = (1 - obj_mask_overlay).astype(np.uint8)
+
+
+                    # obj_selected_gaussians = self.select_gaussians_via_2d_conics(obj_mask_overlay)
+
+
+
+                    # Map 2D mask → Gaussians
+                    obj_selected_gaussians = self.mask_to_gaussian_indices(obj_mask_overlay, min_grad=1e-5)
+                    self.selected_gaussians = obj_selected_gaussians
+
+                    # bg_selected_gaussians = self.mask_to_gaussian_indices(bg_mask_overlay, min_grad=1e-5)
+                    # self.selected_gaussians = bg_selected_gaussians
+
+                    # Edit Gaussians
+                    #self.highlight_selected_gaussians()
+                    #self.highlight_dominant_gaussian()
+                    self.remove_selected_gaussians()
+                    #self.remove_dominant_gaussian()
+
+                    execute_splat_edit = False
+
+
             cv2.putText(rgb_game_img, f"Record Mode: {record_mode}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
             if show_help_menu:
                 cv2.putText(rgb_game_img, "Help Menu - Keyboard Shortcuts", (100, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
                 cv2.putText(rgb_game_img, "C - For Screenshot of Current Camera Render", (100, 250), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-                cv2.putText(rgb_game_img, "WASD - For Translational Camera Control", (100, 350), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-                cv2.putText(rgb_game_img, "IK - YAW Camera Control", (100, 450), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-                cv2.putText(rgb_game_img, "JL - Pitch Camera Control", (100, 550), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-                cv2.putText(rgb_game_img, "UO - Roll Camera Control", (100, 650), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "WA - For Translation Front/Back Camera Control", (100, 350), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "SD - For Translation Left/Right Camera Control", (100, 450), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "QE - For Translation Up/Down Camera Control", (100, 550), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "IK - YAW Camera Control", (100, 650), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "JL - Pitch Camera Control", (100, 750), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "UO - Roll Camera Control", (100, 850), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "Space Bar - Toggle Recorder", (100, 950), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "M - Edit Gaussian Splat Mode", (100, 1050), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
 
             if mouse_click_event:
                 cv2.circle(rgb_game_img, clicked_pixel, 4, (255, 0, 0), -1)
@@ -2393,13 +2709,13 @@ def main():
     # Run AnyLabel to improve annotation performance
     # Enable feature field calculation if you want to lift the segmentation into the Gaussians via backpropagation
 
-    if 1:
-        splat_app_main(sh_degree, ply_file_path, out_dir)
-    else:
-        calculate_gaussian_feature_field_main(sh_degree, ply_file_path, out_dir)
+    # if 1:
+    #     splat_app_main(sh_degree, ply_file_path, out_dir)
+    # else:
+    #     calculate_gaussian_feature_field_main(sh_degree, ply_file_path, out_dir)
 
 
-    # edit_gaussians_main(sh_degree, ply_file_path, out_dir)
+    edit_gaussians_main(sh_degree, ply_file_path, out_dir)
 
 
 if __name__ == "__main__":
