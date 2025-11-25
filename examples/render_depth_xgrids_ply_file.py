@@ -245,6 +245,19 @@ class Recorder:
 
         self.sc_frame_id += 1
 
+    def record_camera_poses(self, camera_poses: np.ndarray):
+        pose_data = {}
+        for i, cam_pose in enumerate(camera_poses):
+            pose_data[i] = cam_pose.tolist()
+        all_data = {
+            "poses": pose_data
+        }
+        json_path = self.out_dir / "recorded_camera_poses.json"
+        with open(json_path, 'w') as f:
+            json.dump(all_data, f, indent=4)
+
+        print(f"✅ saved json file to {json_path}")
+
 class Camera:
     def __init__(self, H=1080, W=1920, fx=1080, fy=1080, near_plane=0.001, far_plane=100.0):
         self.H = H
@@ -267,6 +280,7 @@ class Camera:
         self.yaw = 0.0
 
         self.T = torch.eye(4, dtype=torch.float32).unsqueeze(0).to("cuda")
+        self.recorded_poses = []
 
     def move_camera_quat(self, tx, ty, tz, qx, qy, qz, qw):
         # Convert quaternion to rotation matrix
@@ -1387,21 +1401,22 @@ class SPLAT_APP:
 
 
                     self.selected_gaussians = obj_selected_gaussians
+
                     
 
                     # Edit Gaussians
                     #self.highlight_selected_gaussians()
                     #self.highlight_dominant_gaussian()
-                    #self.remove_selected_gaussians()
+                    self.remove_selected_gaussians()
                     #self.remove_dominant_gaussian()
 
-                    for i, gid in enumerate(self.selected_gaussians):
-                        self.remove_gaussian(gid)
-                        # Rasterize and Display to user
-                        rgb_bgr, _, _, _ = self.rasterize_images()
-                        print(f"Removed {i}-th Gaussian and rendering")
-                        cv2.imshow(edited_gaussian_window_name, rgb_bgr)
-                        key = cv2.waitKey(0)
+                    # for i, gid in enumerate(self.selected_gaussians):
+                    #     self.remove_gaussian(gid)
+                    #     # Rasterize and Display to user
+                    #     rgb_bgr, _, _, _ = self.rasterize_images()
+                    #     print(f"Removed {i}-th Gaussian and rendering")
+                    #     cv2.imshow(edited_gaussian_window_name, rgb_bgr)
+                    #     key = cv2.waitKey(0)
 
                     # Rasterize and Display to user
                     rgb_bgr, _, _, _ = self.rasterize_images()
@@ -1425,6 +1440,113 @@ class SPLAT_APP:
             elif key == ord('q'):
                 cv2.destroyWindow(sam_window_name)
                 return
+
+
+
+    def select_object_interactively_v3(self):
+
+        """
+        Interactive SAM2 segmentation using positive/negative clicks.
+
+        Controls:
+            Left-click  = positive prompt
+            Right-click = negative prompt
+            ENTER       = finalize and return mask
+            r           = reset all points
+            q           = quit (returns None)
+        """
+
+
+        device="cuda"
+        dtype=torch.bfloat16
+
+        sam_window_name = "Interactive SAM2 Segmentation"
+        cv2.namedWindow(sam_window_name, cv2.WINDOW_NORMAL)
+
+        image_rgb, _, _, _ = self.rasterize_images()
+
+        H, W, _ = image_rgb.shape
+
+        img_disp = image_rgb.copy()
+        pos_points = []
+        neg_points = []
+        mask_overlay = None
+
+        # ---- wrapper so callback has correct scope ----
+        def callback(event, x, y, flags, param):
+            nonlocal pos_points, neg_points, mask_overlay, img_disp
+
+            if event == cv2.EVENT_LBUTTONDOWN:
+                pos_points.append((x, y))
+            elif event == cv2.EVENT_RBUTTONDOWN:
+                neg_points.append((x, y))
+            else:
+                return
+
+            # --- run SAM with updated points ---
+            mask_overlay = self.run_sam2_points(
+                image_rgb=image_rgb,
+                pos_points=pos_points,
+                neg_points=neg_points,
+                device=device,
+                dtype=dtype
+            )
+
+            # --- redraw ---
+            img_disp = self.draw_interaction(
+                image_rgb=image_rgb,
+                pos_points=pos_points,
+                neg_points=neg_points,
+                mask_overlay=mask_overlay
+            )
+
+        cv2.setMouseCallback(sam_window_name, callback)
+
+        # === main loop ===
+        while True:
+            cv2.imshow(sam_window_name, img_disp)
+            key = cv2.waitKey(20)
+
+            if key == 13:  # ENTER
+
+                if mask_overlay is None:
+                    print("⚠️ No mask selected (user quit).")
+                else:
+                    # Make sure mask is H x W uint8
+                    if mask_overlay.ndim == 3:
+                        mask_overlay = mask_overlay.squeeze()
+                    obj_mask_overlay = (mask_overlay > 0).astype(np.uint8)
+
+
+                    obj_selected_gaussians = self.select_gaussians_via_2d_conics(obj_mask_overlay)
+
+                    # Rasterize and Display to user
+                    rgb_bgr, _, _, _ = self.rasterize_images()
+                    cv2.putText(rgb_bgr, f"Found {len(obj_selected_gaussians)} Gaussians contributing to that pixel.", (100, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+                    cv2.imshow(sam_window_name, rgb_bgr)
+                    key = cv2.waitKey(0)
+                    cv2.destroyWindow(sam_window_name)
+                    return obj_selected_gaussians
+
+            elif key == ord('r'):
+
+                image_rgb, _, _, _ = self.rasterize_images()
+
+                # Reset mask
+                pos_points = []
+                neg_points = []
+                mask_overlay = None
+                img_disp = image_rgb.copy()
+                cv2.imshow(sam_window_name, image_rgb)
+
+            elif key == ord('q'):
+                obj_selected_gaussians = set()
+                cv2.destroyWindow(sam_window_name)
+                return obj_selected_gaussians
+
+            else:
+                continue
+
 
 
     def select_gaussians_via_2d_conics(self, object_mask, k=2.0):
@@ -1475,7 +1597,9 @@ class SPLAT_APP:
         background_gaussians = set(background_gaussians)
 
         # Remove ONLY pure object Gaussians
-        removable = np.array(list(object_gaussians - background_gaussians), dtype=np.int32)
+        #removable = np.array(list(object_gaussians - background_gaussians), dtype=np.int32)
+
+        removable = object_gaussians - background_gaussians
 
         print(f"🎯 Object Gaussians: {len(object_gaussians)}")
         print(f"🎯 Background Gaussians: {len(background_gaussians)}")
@@ -2140,6 +2264,7 @@ class SPLAT_APP:
         clicked_pixel = None
         splat_edit = False
         execute_gaussian_edit = False
+        grab_cam_pose = False
         pos_points = []
         neg_points = []
         device="cuda"
@@ -2148,6 +2273,8 @@ class SPLAT_APP:
         while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
+                    # DUMP poses to recorded_camera_poses.json
+                    self.recorder.record_camera_poses(self.cam.recorded_poses)
                     running = False
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
@@ -2170,9 +2297,10 @@ class SPLAT_APP:
                         pos_points = []
                         neg_points = []
                         print(f"🖱️  Splat Edit Mode Toggled. Mode: {splat_edit}")
+                    elif event.key == pygame.K_g:
+                        grab_cam_pose = True
                     elif event.key in (pygame.K_KP_ENTER, pygame.K_RETURN):
                         execute_gaussian_edit = True
-
 
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     mouse_click_event = True
@@ -2196,6 +2324,10 @@ class SPLAT_APP:
 
             pose = self.cam.T.squeeze(0).detach().cpu().numpy().astype(np.float32)
             # self.cam.print_camera_pose() # If you want to know where you are in the world
+
+            if grab_cam_pose:
+                self.cam.recorded_poses.append(self.cam.T)
+                grab_cam_pose = False
 
             rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs = self.rasterize_images()
 
@@ -2269,15 +2401,16 @@ class SPLAT_APP:
             cv2.putText(rgb_game_img, f"Record Mode: {record_mode}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
             if show_help_menu:
                 cv2.putText(rgb_game_img, "Help Menu - Keyboard Shortcuts", (100, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
-                cv2.putText(rgb_game_img, "C - For Screenshot of Current Camera Render", (100, 250), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-                cv2.putText(rgb_game_img, "WA - For Translation Front/Back Camera Control", (100, 350), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-                cv2.putText(rgb_game_img, "SD - For Translation Left/Right Camera Control", (100, 450), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-                cv2.putText(rgb_game_img, "QE - For Translation Up/Down Camera Control", (100, 550), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-                cv2.putText(rgb_game_img, "IK - YAW Camera Control", (100, 650), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-                cv2.putText(rgb_game_img, "JL - Pitch Camera Control", (100, 750), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-                cv2.putText(rgb_game_img, "UO - Roll Camera Control", (100, 850), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-                cv2.putText(rgb_game_img, "Space Bar - Toggle Recorder", (100, 950), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
-                cv2.putText(rgb_game_img, "M - Edit Gaussian Splat Mode", (100, 1050), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "C - For Screenshot of Current Camera Render", (100, 200), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "WA - For Translation Front/Back Camera Control", (100, 250), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "SD - For Translation Left/Right Camera Control", (100, 300), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "QE - For Translation Up/Down Camera Control", (100, 350), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "IK - YAW Camera Control", (100, 400), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "JL - Pitch Camera Control", (100, 450), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "UO - Roll Camera Control", (100, 500), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "Space Bar - Toggle Recorder", (100, 550), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "M - Edit Gaussian Splat Mode", (100, 600), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
+                cv2.putText(rgb_game_img, "G - Record Camera Pose", (100, 650), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,0,0), 2)
 
             if mouse_click_event:
                 cv2.circle(rgb_game_img, clicked_pixel, 4, (255, 0, 0), -1)
@@ -2661,13 +2794,45 @@ def edit_gaussians_main(sh_degree, ply_file_path, out_dir):
     
     splat_app = SPLAT_APP(cam, gaussian_model, recorder)
 
-    
-    if 0:
-        # Select Pixel Interactively
-        splat_app.select_pixel_interactively()
+    # Walkthrough the splat to assess quality of edit
+    splat_app.vr_walkthrough_pygame(record_mode)
+    print("Walk through is done... Replay with noise now....")
+
+
+    # Iterate over Recorded Camera Poses
+    splat_app.selected_gaussians = set()
+    if len(splat_app.cam.recorded_poses) > 0:
+        for T in splat_app.cam.recorded_poses:
+            splat_app.cam.T = T
+            obj_selected_gaussians = splat_app.select_object_interactively_v3()
+            splat_app.selected_gaussians.update(obj_selected_gaussians)
+
+        splat_app.selected_gaussians = np.array(list(splat_app.selected_gaussians), dtype=np.int32)
+        splat_app.remove_selected_gaussians()
+        # Rasterize and Display to user from all views
+        edited_gaussian_window_name = "Gaussian Edited Image"
+        for T in splat_app.cam.recorded_poses:
+            splat_app.cam.T = T
+            rgb_bgr, _, _, _ = splat_app.rasterize_images()
+            cv2.putText(rgb_bgr, f"Found {len(splat_app.selected_gaussians)} Gaussians contributing to the object.", (100, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+            cv2.imshow(edited_gaussian_window_name, rgb_bgr)
+            key = cv2.waitKey(0)
+            cv2.destroyWindow(edited_gaussian_window_name)
     else:
-        # Select Object Interactively
         splat_app.select_object_interactively_v2()
+
+    
+    # Walkthrough the splat to assess quality of edit
+    splat_app.vr_walkthrough_pygame(record_mode)
+    print("Walk through is done... Replay with noise now....")
+
+
+    # if 0:
+    #     # Select Pixel Interactively
+    #     splat_app.select_pixel_interactively()
+    # else:
+    #     # Select Object Interactively
+    #     splat_app.select_object_interactively_v2()
 
     # if 1:
     #     # Remove Selected Gaussians
@@ -2680,9 +2845,7 @@ def edit_gaussians_main(sh_degree, ply_file_path, out_dir):
     # # Debug render to check editing quality
     # splat_app.debug_render_original_and_edited()
 
-    # Walkthrough the splat to assess quality of edit
-    splat_app.vr_walkthrough_pygame(record_mode)
-    print("Walk through is done... Replay with noise now....")
+
 
 def main():
 
