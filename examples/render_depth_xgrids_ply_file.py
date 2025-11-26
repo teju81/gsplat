@@ -1205,6 +1205,7 @@ class SPLAT_APP:
         selected_gids     = self.selected_gaussians["gaussian_ids"] if self.gaussian_visualization_settings["selected_gaussians"] else []
         removed_gids      = self.removed_gaussians["gaussian_ids"] if self.gaussian_visualization_settings["removed_gaussians"] else []
         object_gids   = self.object_gaussians["gaussian_ids"] if self.gaussian_visualization_settings["object_gaussians"] else []
+        bg_gids   = self.background_gaussians["gaussian_ids"] if self.gaussian_visualization_settings["background_gaussians"] else []
 
 
         # Convert gray → 3-channel
@@ -1223,8 +1224,8 @@ class SPLAT_APP:
                 color = (0, 255, 0)
             elif gid in object_gids:
                 color = (255, 165, 0)
-            # elif gid in bg_gids:
-            #     color = (255, 0, 255)
+            elif gid in bg_gids:
+                color = (255, 0, 255)
             else:
                 continue
 
@@ -1362,6 +1363,9 @@ class SPLAT_APP:
             "gaussian_ids": obj_gids,
         } # Use this for single view operations
 
+        self.update_background_gaussians()
+
+
     def reset_object_gaussians(self):
 
         self.object_gaussians = {
@@ -1375,20 +1379,24 @@ class SPLAT_APP:
         } # Use this for single view operations
 
 
-    # def update_background_gaussians(self, selected_gaussian_ids):
+    def update_background_gaussians(self):
+        N = self.gaussian_model._xyz.shape[0]
+        all_gids = set(range(N))
 
-    #     self.object_gaussians["gaussian_ids"].update(selected_gaussian_ids)
-    #     obj_gids = self.object_gaussians["gaussian_ids"]
+        self.object_gaussians["gaussian_ids"].update(selected_gaussian_ids)
+        obj_gids = self.object_gaussians["gaussian_ids"]
+        bg_gids = all_gids - obj_gids
+        bg_gids_list = sorted(list(bg_gids))
 
-    #     self.object_gaussians = {
-    #         "_xyz": self.gaussian_model._xyz[obj_gids].clone(),
-    #         "_rotation": self.gaussian_model._rotation[obj_gids].clone(),
-    #         "_scaling": self.gaussian_model._scaling[obj_gids].clone(),
-    #         "_opacity": self.gaussian_model._opacity[obj_gids].clone(),
-    #         "_features_dc": self.gaussian_model._features_dc[obj_gids].clone(),
-    #         "_features_rest": self.gaussian_model._features_rest[obj_gids].clone(),
-    #         "gaussian_ids": obj_gids,
-    #     } # Use this for single view operations
+        self.background_gaussians = {
+            "_xyz": self.gaussian_model._xyz[bg_gids_list].clone(),
+            "_rotation": self.gaussian_model._rotation[bg_gids_list].clone(),
+            "_scaling": self.gaussian_model._scaling[bg_gids_list].clone(),
+            "_opacity": self.gaussian_model._opacity[bg_gids_list].clone(),
+            "_features_dc": self.gaussian_model._features_dc[bg_gids_list].clone(),
+            "_features_rest": self.gaussian_model._features_rest[bg_gids_list].clone(),
+            "gaussian_ids": bg_gids,
+        } # Use this for single view operations
 
 
 
@@ -1704,7 +1712,7 @@ class SPLAT_APP:
             "selected_gaussians": False,
             "object_gaussians": True,
             "removed_gaussians": False,
-            "background_gaussians": False,
+            "background_gaussians": True,
         }
         edited_gaussian_window_name = "selected_gaussian_window"
 
@@ -1714,7 +1722,7 @@ class SPLAT_APP:
                 obj_selected_gaussians, obj_mask_overlay = self.select_object_gaussians_interactive_sam()
                 self.store_selected_gaussians(obj_selected_gaussians)
                 self.update_object_gaussians(obj_selected_gaussians)
-                self.make_selected_gaussians_invisible()
+                #self.make_selected_gaussians_invisible()
 
                 rgb_bgr, _, _, _ = self.rasterize_images(visualize_gaussians=True)
                 #cv2.putText(rgb_bgr, f"Found {len(obj_selected_gaussians)} Gaussians contributing to the object.", (100, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
