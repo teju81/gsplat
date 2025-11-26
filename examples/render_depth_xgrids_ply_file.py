@@ -1392,39 +1392,40 @@ class SPLAT_APP:
 
 
 
-    def make_selected_gaussians_invisible(self, selected_gaussian_ids):
+    def make_selected_gaussians_invisible(self):
+        selected_gaussian_ids = np.array(list(self.selected_gaussians["gaussian_ids"]), dtype=np.int32)
         with torch.no_grad():
             self.gaussian_model._opacity[selected_gaussian_ids] = -10.0
 
 
-    def remove_selected_gaussians(self):
-        """
-        Remove the selected Gaussians
-        and update the gaussian_model to contain only the remaining ones.
-        """
+    # def remove_selected_gaussians(self):
+    #     """
+    #     Remove the selected Gaussians
+    #     and update the gaussian_model to contain only the remaining ones.
+    #     """
 
-        if not hasattr(self, "selected_gaussians"):
-            print("⚠️ No gaussians selected. Run select_object_interactively() first.")
-            return
+    #     if not hasattr(self, "selected_gaussians"):
+    #         print("⚠️ No gaussians selected. Run select_object_interactively() first.")
+    #         return
 
-        selected_gaussian_ids = np.array(list(self.selected_gaussians["gaussian_ids"]), dtype=np.int32)
+    #     selected_gaussian_ids = np.array(list(self.selected_gaussians["gaussian_ids"]), dtype=np.int32)
 
-        remove_idx = torch.from_numpy(selected_gaussian_ids).to("cuda")
-        N = self.gaussian_model._xyz.shape[0]
+    #     remove_idx = torch.from_numpy(selected_gaussian_ids).to("cuda")
+    #     N = self.gaussian_model._xyz.shape[0]
 
-        mask = torch.ones(N, device="cuda", dtype=torch.bool)
-        mask[remove_idx] = False   # keep everything else
+    #     mask = torch.ones(N, device="cuda", dtype=torch.bool)
+    #     mask[remove_idx] = False   # keep everything else
 
-        print(f"🗑️ Removing {remove_idx.numel()} gaussians, keeping {mask.sum().item()}")
+    #     print(f"🗑️ Removing {remove_idx.numel()} gaussians, keeping {mask.sum().item()}")
 
-        # Update all gaussian attributes
-        with torch.no_grad():
-            self.gaussian_model._xyz        = self.gaussian_model._xyz[mask]
-            self.gaussian_model._rotation   = self.gaussian_model._rotation[mask]
-            self.gaussian_model._scaling    = self.gaussian_model._scaling[mask]
-            self.gaussian_model._opacity    = self.gaussian_model._opacity[mask]
-            self.gaussian_model._features_dc   = self.gaussian_model._features_dc[mask]
-            self.gaussian_model._features_rest = self.gaussian_model._features_rest[mask]
+    #     # Update all gaussian attributes
+    #     with torch.no_grad():
+    #         self.gaussian_model._xyz        = self.gaussian_model._xyz[mask]
+    #         self.gaussian_model._rotation   = self.gaussian_model._rotation[mask]
+    #         self.gaussian_model._scaling    = self.gaussian_model._scaling[mask]
+    #         self.gaussian_model._opacity    = self.gaussian_model._opacity[mask]
+    #         self.gaussian_model._features_dc   = self.gaussian_model._features_dc[mask]
+    #         self.gaussian_model._features_rest = self.gaussian_model._features_rest[mask]
 
 
     def shift_selected_gaussians(self, 
@@ -1713,7 +1714,7 @@ class SPLAT_APP:
                 obj_selected_gaussians, obj_mask_overlay = self.select_object_gaussians_interactive_sam()
                 self.store_selected_gaussians(obj_selected_gaussians)
                 self.update_object_gaussians(obj_selected_gaussians)
-                #self.remove_selected_gaussians()
+                self.make_selected_gaussians_invisible()
 
                 rgb_bgr, _, _, _ = self.rasterize_images(visualize_gaussians=True)
                 #cv2.putText(rgb_bgr, f"Found {len(obj_selected_gaussians)} Gaussians contributing to the object.", (100, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
