@@ -282,10 +282,10 @@ class Recorder:
 
         self.sc_frame_id += 1
 
-    def record_camera_poses(self, camera_poses: np.ndarray):
+    def record_camera_poses(self, camera_poses):
         pose_data = {}
         for i, cam_pose in enumerate(camera_poses):
-            pose_data[i] = cam_pose.tolist()
+            pose_data[i] = cam_pose
         all_data = {
             "poses": pose_data
         }
@@ -1723,7 +1723,7 @@ class SPLAT_APP:
         if len(self.cam.recorded_poses) > 0:
             for T in self.cam.recorded_poses:
                 self.cam.T = T
-                obj_selected_gaussians, obj_mask_overlay = self.select_object_gaussians_interactive_sam()
+                obj_selected_gaussians, obj_mask_overlay = self.select_object_gaussians_interactive_sam(prune_method_id=1)
                 self.store_selected_gaussians(obj_selected_gaussians)
                 self.update_object_gaussians(obj_selected_gaussians)
                 #self.make_selected_gaussians_invisible()
@@ -1751,23 +1751,17 @@ class SPLAT_APP:
                 "background_gaussians": False,
             }
 
-            img_bgr, img_rgb, depth, depth_norm = self.rasterize_images(visualize_gaussians=True)
-            #cv2.putText(img_bgr, f"Found {len(obj_selected_gaussians)} Gaussians contributing to the object.", (100, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
-            cv2.imshow(edited_gaussian_window_name1, img_bgr)
-            #cv2.imshow(edited_gaussian_window_name2, depth)
-            key = cv2.waitKey(0)
-            cv2.destroyWindow(edited_gaussian_window_name1)
-            #cv2.destroyWindow(edited_gaussian_window_name2)
-
-            # # Rasterize and Display to user from all views
-            # edited_gaussian_window_name = "Gaussian Edited Image"
-            # for T in self.cam.recorded_poses:
-            #     self.cam.T = T
-            #     rgb_bgr, _, _, _ = self.rasterize_images()
-            #     cv2.putText(rgb_bgr, f"Found {len(selected_gaussian_ids)} Gaussians contributing to the object.", (100, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
-            #     cv2.imshow(edited_gaussian_window_name, rgb_bgr)
-            #     key = cv2.waitKey(0)
-            #     cv2.destroyWindow(edited_gaussian_window_name)
+            # Rasterize and Display to user from all views
+            edited_gaussian_window_name = "Gaussian Edited Image"
+            for T in self.cam.recorded_poses:
+                self.cam.T = T
+                img_bgr, img_rgb, depth, depth_norm = self.rasterize_images(visualize_gaussians=True)
+                #cv2.putText(img_bgr, f"Found {len(obj_selected_gaussians)} Gaussians contributing to the object.", (100, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+                cv2.imshow(edited_gaussian_window_name1, img_bgr)
+                #cv2.imshow(edited_gaussian_window_name2, depth)
+                key = cv2.waitKey(0)
+                cv2.destroyWindow(edited_gaussian_window_name1)
+                #cv2.destroyWindow(edited_gaussian_window_name2)
 
         return
 
@@ -2045,22 +2039,38 @@ class SPLAT_APP:
         object_gaussians = set(selected.cpu().numpy())
         print(f"✅ mask_to_gaussian_indices: selected {len(object_gaussians)} / {N} gaussians")
 
+        # Approach 1: Reject Gaussians with means outside the object mask
+        ids = meta["gaussian_ids"].detach().cpu().numpy()   # [M]
+        conics = meta["conics"].detach().cpu().numpy()  # [M,3]
+        means2d = meta["means2d"].detach().cpu().numpy()  # [M,2]
+        global_to_local = {gid: i for i, gid in enumerate(ids)}
+
+        selected_list = list(object_gaussians)
+
+        filtered = []
 
         # Apply your filters to remove some of the influential Gaussians
 
         if prune_method_id == 1:
 
-            # Approach 1: Reject Gaussians with means outside the object mask
-            means2d = meta["means2d"].detach().cpu().numpy()  # [M,2]
-            selected_list = list(object_gaussians)
+            
 
-            filtered = []
-            for idx in selected_list:
-                u, v = means2d[idx,:]
+            # Approach 1: Reject Gaussians with means outside the object mask
+
+            for gid in selected_list:
+                if gid not in global_to_local:
+                    # gaussian is not visible in this view → skip
+                    continue
+                
+                local_idx = global_to_local[gid]
+
+                u, v = means2d[local_idx]   
+
+
                 u, v = int(u), int(v)
                 if 0 <= u < W and 0 <= v < H:
                     if obj_mask_np[v, u] == 1:
-                        filtered.append(idx)
+                        filtered.append(gid)
 
             object_gaussians = set(filtered)
 
@@ -2068,7 +2078,6 @@ class SPLAT_APP:
         elif prune_method_id == 2:
 
             # Approach 2: Reject Gaussians whose projected 2D ellipse does NOT overlap the mask
-            conics = meta["conics"].detach().cpu().numpy()  # [M,3]
 
             def fast_conic_inside_mask(mean, conic, mask):
                 u0, v0 = mean
@@ -2082,11 +2091,17 @@ class SPLAT_APP:
                 umin, umax = max(0, u0-sx), min(mask.shape[1], u0+sx)
                 return mask[vmin:vmax, umin:umax].max() > 0
 
-            filtered = []
-            for idx in object_gaussians:
-                u, v = means2d[idx]
-                if fast_conic_inside_mask((u,v), conics[idx], obj_mask_np):
-                    filtered.append(idx)
+
+            for gid in selected_list:
+                if gid not in global_to_local:
+                    # gaussian is not visible in this view → skip
+                    continue
+                
+                local_idx = global_to_local[gid]
+
+                u, v = means2d[local_idx]
+                if fast_conic_inside_mask((u,v), conics[local_idx], obj_mask_np):
+                    filtered.append(gid)
 
             object_gaussians = set(filtered)
 
@@ -2719,8 +2734,8 @@ class SPLAT_APP:
 
                     if event.key == pygame.K_ESCAPE:
 
-                        # # DUMP poses to recorded_camera_poses.json
-                        # self.recorder.record_camera_poses(self.cam.recorded_poses)
+                        # DUMP poses to recorded_camera_poses.json
+                        self.recorder.record_camera_poses(self.cam.recorded_poses)
 
                         running = False
                     elif event.key == pygame.K_SPACE:
@@ -3253,13 +3268,14 @@ def edit_gaussians_main(sh_degree, ply_file_path, out_dir):
             for pose in multiview_cam_poses:
                 cam.recorded_poses.append(pose)
             record_multiview_poses = False
+
     except FileNotFoundError:
         record_multiview_poses = True
 
     splat_app = SPLAT_APP(cam, gaussian_model, recorder)
 
     # Walkthrough the splat to assess quality of edit
-    if record_multiview_poses:
+    if record_multiview_poses or True:
         splat_app.vr_walkthrough_pygame(record_mode)
         print("Walk through is done... Replay with noise now....")
 
