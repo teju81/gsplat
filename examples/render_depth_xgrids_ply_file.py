@@ -1363,7 +1363,7 @@ class SPLAT_APP:
             "gaussian_ids": obj_gids,
         } # Use this for single view operations
 
-        self.update_background_gaussians()
+        self.update_background_gaussians(selected_gaussian_ids)
 
 
     def reset_object_gaussians(self):
@@ -1379,7 +1379,7 @@ class SPLAT_APP:
         } # Use this for single view operations
 
 
-    def update_background_gaussians(self):
+    def update_background_gaussians(self, selected_gaussian_ids):
         N = self.gaussian_model._xyz.shape[0]
         all_gids = set(range(N))
 
@@ -1400,43 +1400,43 @@ class SPLAT_APP:
 
 
 
-    def make_selected_gaussians_invisible(self):
-        selected_gaussian_ids = np.array(list(self.selected_gaussians["gaussian_ids"]), dtype=np.int32)
+    def make_object_gaussians_invisible(self):
+        selected_gaussian_ids = np.array(list(self.object_gaussians["gaussian_ids"]), dtype=np.int32)
         with torch.no_grad():
             self.gaussian_model._opacity[selected_gaussian_ids] = -10.0
 
 
-    # def remove_selected_gaussians(self):
-    #     """
-    #     Remove the selected Gaussians
-    #     and update the gaussian_model to contain only the remaining ones.
-    #     """
+    def remove_object_gaussians(self):
+        """
+        Remove the selected Gaussians
+        and update the gaussian_model to contain only the remaining ones.
+        """
 
-    #     if not hasattr(self, "selected_gaussians"):
-    #         print("⚠️ No gaussians selected. Run select_object_interactively() first.")
-    #         return
+        if not hasattr(self, "selected_gaussians"):
+            print("⚠️ No gaussians selected. Run select_object_interactively() first.")
+            return
 
-    #     selected_gaussian_ids = np.array(list(self.selected_gaussians["gaussian_ids"]), dtype=np.int32)
+        selected_gaussian_ids = np.array(list(self.object_gaussians["gaussian_ids"]), dtype=np.int32)
 
-    #     remove_idx = torch.from_numpy(selected_gaussian_ids).to("cuda")
-    #     N = self.gaussian_model._xyz.shape[0]
+        remove_idx = torch.from_numpy(selected_gaussian_ids).to("cuda")
+        N = self.gaussian_model._xyz.shape[0]
 
-    #     mask = torch.ones(N, device="cuda", dtype=torch.bool)
-    #     mask[remove_idx] = False   # keep everything else
+        mask = torch.ones(N, device="cuda", dtype=torch.bool)
+        mask[remove_idx] = False   # keep everything else
 
-    #     print(f"🗑️ Removing {remove_idx.numel()} gaussians, keeping {mask.sum().item()}")
+        print(f"🗑️ Removing {remove_idx.numel()} gaussians, keeping {mask.sum().item()}")
 
-    #     # Update all gaussian attributes
-    #     with torch.no_grad():
-    #         self.gaussian_model._xyz        = self.gaussian_model._xyz[mask]
-    #         self.gaussian_model._rotation   = self.gaussian_model._rotation[mask]
-    #         self.gaussian_model._scaling    = self.gaussian_model._scaling[mask]
-    #         self.gaussian_model._opacity    = self.gaussian_model._opacity[mask]
-    #         self.gaussian_model._features_dc   = self.gaussian_model._features_dc[mask]
-    #         self.gaussian_model._features_rest = self.gaussian_model._features_rest[mask]
+        # Update all gaussian attributes
+        with torch.no_grad():
+            self.gaussian_model._xyz        = self.gaussian_model._xyz[mask]
+            self.gaussian_model._rotation   = self.gaussian_model._rotation[mask]
+            self.gaussian_model._scaling    = self.gaussian_model._scaling[mask]
+            self.gaussian_model._opacity    = self.gaussian_model._opacity[mask]
+            self.gaussian_model._features_dc   = self.gaussian_model._features_dc[mask]
+            self.gaussian_model._features_rest = self.gaussian_model._features_rest[mask]
 
 
-    def shift_selected_gaussians(self, 
+    def shift_object_gaussians(self, 
                                  translation=(0,0,0), 
                                  rotation_deg=(0,0,0)):
         """
@@ -1450,7 +1450,10 @@ class SPLAT_APP:
             print("⚠️ No gaussians selected. Run select_object_interactively() first.")
             return
 
-        sel = torch.from_numpy(self.selected_gaussians).to("cuda")
+        selected_gaussian_ids = np.array(list(self.object_gaussians["gaussian_ids"]), dtype=np.int32)
+
+
+        sel = torch.from_numpy(selected_gaussian_ids).to("cuda")
 
         # ---- Extract dx, dy, dz ----
         dx, dy, dz = translation
@@ -1712,9 +1715,10 @@ class SPLAT_APP:
             "selected_gaussians": False,
             "object_gaussians": True,
             "removed_gaussians": False,
-            "background_gaussians": True,
+            "background_gaussians": False,
         }
-        edited_gaussian_window_name = "selected_gaussian_window"
+        edited_gaussian_window_name1 = "selected_gaussian_window_rgb"
+        edited_gaussian_window_name2 = "selected_gaussian_window_depth"
 
         if len(self.cam.recorded_poses) > 0:
             for T in self.cam.recorded_poses:
@@ -1724,15 +1728,18 @@ class SPLAT_APP:
                 self.update_object_gaussians(obj_selected_gaussians)
                 #self.make_selected_gaussians_invisible()
 
-                rgb_bgr, _, _, _ = self.rasterize_images(visualize_gaussians=True)
-                #cv2.putText(rgb_bgr, f"Found {len(obj_selected_gaussians)} Gaussians contributing to the object.", (100, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
-                cv2.imshow(edited_gaussian_window_name, rgb_bgr)
+                img_bgr, img_rgb, depth, depth_norm = self.rasterize_images(visualize_gaussians=True)
+                #cv2.putText(img_bgr, f"Found {len(obj_selected_gaussians)} Gaussians contributing to the object.", (100, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+                cv2.imshow(edited_gaussian_window_name1, img_bgr)
+                #cv2.imshow(edited_gaussian_window_name2, depth)
                 key = cv2.waitKey(0)
-                cv2.destroyWindow(edited_gaussian_window_name)
+
+                cv2.destroyWindow(edited_gaussian_window_name1)
+                #cv2.destroyWindow(edited_gaussian_window_name2)
 
                 self.restore_original_gaussians()
 
-            self.remove_object_gaussians()
+            self.make_object_gaussians_invisible()
 
             self.gaussian_visualization_settings = {
                 "enabled": True,
@@ -1741,14 +1748,16 @@ class SPLAT_APP:
                 "selected_gaussians": False,
                 "object_gaussians": True,
                 "removed_gaussians": False,
-                "background_gaussians": True,
+                "background_gaussians": False,
             }
 
-            rgb_bgr, _, _, _ = self.rasterize_images(visualize_gaussians=True)
-            #cv2.putText(rgb_bgr, f"Found {len(obj_selected_gaussians)} Gaussians contributing to the object.", (100, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
-            cv2.imshow(edited_gaussian_window_name, rgb_bgr)
+            img_bgr, img_rgb, depth, depth_norm = self.rasterize_images(visualize_gaussians=True)
+            #cv2.putText(img_bgr, f"Found {len(obj_selected_gaussians)} Gaussians contributing to the object.", (100, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+            cv2.imshow(edited_gaussian_window_name1, img_bgr)
+            #cv2.imshow(edited_gaussian_window_name2, depth)
             key = cv2.waitKey(0)
-            cv2.destroyWindow(edited_gaussian_window_name)
+            cv2.destroyWindow(edited_gaussian_window_name1)
+            #cv2.destroyWindow(edited_gaussian_window_name2)
 
             # # Rasterize and Display to user from all views
             # edited_gaussian_window_name = "Gaussian Edited Image"
@@ -1763,7 +1772,7 @@ class SPLAT_APP:
         return
 
 
-    def select_object_gaussians_interactive_sam(self):
+    def select_object_gaussians_interactive_sam(self, prune_method_id=0):
 
         device = "cuda"
         dtype = torch.bfloat16
@@ -1835,7 +1844,7 @@ class SPLAT_APP:
 
                 # Select Gaussians
                 obj_selected_gaussians = self.mask_to_gaussian_indices(
-                    obj_mask_overlay, min_grad=1e-5
+                    obj_mask_overlay, min_grad=1e-5, prune_method_id=prune_method_id
                 )
 
                 cv2.putText(
@@ -1975,7 +1984,7 @@ class SPLAT_APP:
         return 
 
 
-    def mask_to_gaussian_indices(self, obj_mask_np: np.ndarray, min_grad: float = 1e-5):
+    def mask_to_gaussian_indices(self, obj_mask_np: np.ndarray, min_grad: float = 1e-5, prune_method_id = 0):
         """
         Given a 2D binary mask over the rendered image, find which Gaussians
         contributed to the pixels inside the mask.
@@ -2036,8 +2045,62 @@ class SPLAT_APP:
         object_gaussians = set(selected.cpu().numpy())
         print(f"✅ mask_to_gaussian_indices: selected {len(object_gaussians)} / {N} gaussians")
 
-        return object_gaussians
 
+        # Apply your filters to remove some of the influential Gaussians
+
+        if prune_method_id == 1:
+
+            # Approach 1: Reject Gaussians with means outside the object mask
+            means2d = meta["means2d"].detach().cpu().numpy()  # [M,2]
+            selected_list = list(object_gaussians)
+
+            filtered = []
+            for idx in selected_list:
+                u, v = means2d[idx,:]
+                u, v = int(u), int(v)
+                if 0 <= u < W and 0 <= v < H:
+                    if obj_mask_np[v, u] == 1:
+                        filtered.append(idx)
+
+            object_gaussians = set(filtered)
+
+
+        elif prune_method_id == 2:
+
+            # Approach 2: Reject Gaussians whose projected 2D ellipse does NOT overlap the mask
+            conics = meta["conics"].detach().cpu().numpy()  # [M,3]
+
+            def fast_conic_inside_mask(mean, conic, mask):
+                u0, v0 = mean
+                A, B, C = conic
+                P = np.array([[A, B],[B, C]])
+                Sigma = np.linalg.inv(P + 1e-6*np.eye(2))
+                sx = int(max(1, 3*np.sqrt(Sigma[0,0])))
+                sy = int(max(1, 3*np.sqrt(Sigma[1,1])))
+                u0, v0 = int(u0), int(v0)
+                vmin, vmax = max(0, v0-sy), min(mask.shape[0], v0+sy)
+                umin, umax = max(0, u0-sx), min(mask.shape[1], u0+sx)
+                return mask[vmin:vmax, umin:umax].max() > 0
+
+            filtered = []
+            for idx in object_gaussians:
+                u, v = means2d[idx]
+                if fast_conic_inside_mask((u,v), conics[idx], obj_mask_np):
+                    filtered.append(idx)
+
+            object_gaussians = set(filtered)
+
+        elif prune_method_id == 3:
+
+            # Approach 3: PRUNE lOW OPACITY GAUSSIANS
+            op = torch.sigmoid(self.gaussian_model._opacity).detach().cpu().numpy()
+
+            filtered = [idx for idx in object_gaussians if op[idx] > 0.05]
+
+            object_gaussians = set(filtered)
+
+
+        return object_gaussians
 
     def select_gaussians_via_2d_conics(self, object_mask, k=2.0):
         """
@@ -2651,11 +2714,14 @@ class SPLAT_APP:
         while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
-                    # DUMP poses to recorded_camera_poses.json
-                    self.recorder.record_camera_poses(self.cam.recorded_poses)
                     running = False
                 elif event.type == pygame.KEYDOWN:
+
                     if event.key == pygame.K_ESCAPE:
+
+                        # # DUMP poses to recorded_camera_poses.json
+                        # self.recorder.record_camera_poses(self.cam.recorded_poses)
+
                         running = False
                     elif event.key == pygame.K_SPACE:
                         if record_mode == Record_Mode.PAUSE:
@@ -3162,19 +3228,40 @@ def encode_feature_maps(model, feature_dir, latent_dim):
 def edit_gaussians_main(sh_degree, ply_file_path, out_dir):
     
     gaussian_model = GaussianModel(sh_degree, ply_file_path)
-
-    cam = init_cam()
     
     #record_mode = Record_Mode.CONTINUE
     record_mode = Record_Mode.PAUSE
 
     recorder = Recorder(out_dir, record_mode)
-    
+
+    cam = init_cam()
+
+    record_multiview_poses = True
+
+    try:
+        # Load multiview_camera_poses recorded
+        json_path = Path(out_dir) / "recorded_camera_poses.json" 
+            
+        with open(json_path, "r") as f:
+            data = json.load(f)
+            multiview_cam_poses = data["poses"]
+
+        if len(multiview_cam_poses) == 0:
+            print("⚠️ recorded_camera_poses.json has no poses!")
+            record_multiview_poses = True
+        else:
+            for pose in multiview_cam_poses:
+                cam.recorded_poses.append(pose)
+            record_multiview_poses = False
+    except FileNotFoundError:
+        record_multiview_poses = True
+
     splat_app = SPLAT_APP(cam, gaussian_model, recorder)
 
     # Walkthrough the splat to assess quality of edit
-    splat_app.vr_walkthrough_pygame(record_mode)
-    print("Walk through is done... Replay with noise now....")
+    if record_multiview_poses:
+        splat_app.vr_walkthrough_pygame(record_mode)
+        print("Walk through is done... Replay with noise now....")
 
 
     splat_app.select_object_gaussians_multiview()
@@ -3190,9 +3277,9 @@ def edit_gaussians_main(sh_degree, ply_file_path, out_dir):
     # splat_app.select_object_interactively_v2()
 
     
-    # Walkthrough the splat to assess quality of edit
-    splat_app.vr_walkthrough_pygame(record_mode)
-    print("Walk through is done... Replay with noise now....")
+    # # Walkthrough the splat to assess quality of edit
+    # splat_app.vr_walkthrough_pygame(record_mode)
+    # print("Walk through is done... Replay with noise now....")
 
 
     # if 0:
