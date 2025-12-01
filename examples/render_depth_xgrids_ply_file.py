@@ -41,6 +41,9 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 
+import trimesh
+import pyrender
+
 def conic_to_ellipse(conic, mean, scale=1.0, num_pts=60):
     """
     conic: [A,B,C]
@@ -3015,6 +3018,217 @@ class SPLAT_APP:
         return poses
 
 
+    ############################################################
+    # 1. Create TSDF volume
+    ############################################################
+
+    def create_tsdf_voxelgrid(self, voxel_size=0.01, sdf_trunc=0.04, color=False):
+        return o3d.pipelines.integration.ScalableTSDFVolume(
+            voxel_length=voxel_size,
+            sdf_trunc=sdf_trunc,
+            color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8 \
+                if color else \
+                o3d.pipelines.integration.TSDFVolumeColorType.NoColor
+        )
+
+    ############################################################
+    # 2. Integrate one depth map into TSDF
+    ############################################################
+
+    def integrate_depth(self, tsdf_volume, depth_m, intrinsic, extrinsic):
+
+        H, W = depth_m.shape
+
+        # depth as Open3D Image
+        depth_o3d = o3d.geometry.Image(depth_m.astype(np.float32))
+
+        # dummy color (Open3D CUDA TSDF requires RGBD input)
+        color_dummy = np.zeros((H, W, 3), dtype=np.uint8)
+        color_o3d = o3d.geometry.Image(color_dummy)
+
+        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+            color=color_o3d,
+            depth=depth_o3d,
+            depth_scale=1.0,
+            depth_trunc=3.0,
+            convert_rgb_to_intensity=False
+        )
+
+        tsdf_volume.integrate(
+            rgbd,
+            intrinsic,
+            extrinsic
+        )
+
+        pc = tsdf_volume.extract_voxel_point_cloud()
+        points = np.asarray(pc.points)
+        print("TSDF voxel count:", points.shape)
+        temp_mesh = tsdf_volume.extract_triangle_mesh()
+        print("Mesh vertices:", len(temp_mesh.vertices))
+
+
+
+    ############################################################
+    # 3. Convert TSDF into mesh via Marching Cubes
+    ############################################################
+
+    def extract_mesh(self, tsdf_volume):
+        mesh = tsdf_volume.extract_triangle_mesh()
+        mesh.compute_vertex_normals()
+        return mesh
+
+    ############################################################
+    # 4. Save mesh
+    ############################################################
+
+    def save_mesh(self, mesh, filename):
+        o3d.io.write_triangle_mesh(filename, mesh)
+        print(f"Saved mesh to {filename}")
+
+    ############################################################
+    # 5. Main pipeline
+    ############################################################
+
+    def construct_mesh_from_depth_map_folder(self, voxel_size=0.02, trunc=0.1):
+
+
+        intrinsic = o3d.camera.PinholeCameraIntrinsic(self.cam.W, self.cam.H, self.cam.fx, self.cam.fy, self.cam.cx, self.cam.cy)
+
+        tsdf = self.create_tsdf_voxelgrid(voxel_size=voxel_size, sdf_trunc=trunc)
+
+        # Supported image formats
+        extensions = [".jpg", ".jpeg", ".png"]
+
+        device = "cuda"
+
+
+        # === Read poses from JSON ===
+        json_path = self.recorder.out_dir / "poses.json"
+
+        # === Read poses from JSON ===
+        with open(json_path, "r") as f:
+            data = json.load(f)
+        pose_data = data["poses"]
+
+        self.recorder.depth_dir
+
+
+        # === Iterate over all frames ===
+        for frame_id_str, pose_list in pose_data.items():
+            frame_id = int(frame_id_str)
+            print(f"processing frame id: {frame_id}...")
+            # if frame_id > 20:
+            #     break
+
+            name = f"frame_{frame_id:04d}.png"
+            depth_path = os.path.join(self.recorder.depth_dir, name)
+
+            print(f"🔹 Processing: {depth_path}")
+
+            # ---- Load depth ----
+            depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+
+            if depth is None:
+                print("❌ Depth image missing:", depth_path)
+                continue
+
+            # convert uint16 mm → float32 meters
+            depth_m = depth.astype(np.float32) / 1.0
+
+            H, W = depth_m.shape
+
+
+            # ---- Load pose and convert ----
+            pose_c2w = torch.tensor(pose_list, dtype=torch.float32).cpu()
+            pose_w2c = torch.inverse(pose_c2w)         # world → camera
+            extrinsic = pose_w2c.numpy().astype(np.float64)
+
+            # ---- Integrate ----
+            self.integrate_depth(tsdf, depth_m, intrinsic, extrinsic)
+
+
+            # depth_n = normalize_depth(depth_m, depth_m.min(), depth_m.max())
+            # cv2.imshow("norm Depth", depth_n)
+            # cv2.waitKey(0)
+            # cv2.destroyAllWindows()
+
+        mesh = self.extract_mesh(tsdf)
+        self.save_mesh(mesh, self.recorder.out_dir / "mesh.obj")
+
+        # Visualize RGBD from the mesh
+        
+        # color, depth = render_rgbd_from_obj(self.cam, self.recorder.out_dir / "mesh.obj")
+
+        renderer = o3d.visualization.rendering.OffscreenRenderer(self.cam.W, self.cam.H)
+        renderer.scene.set_background([0, 0, 0, 1])
+
+        material = o3d.visualization.rendering.MaterialRecord()
+        material.shader = "defaultLit"
+        renderer.scene.add_geometry("mesh", mesh, material)
+
+        intrinsic = o3d.camera.PinholeCameraIntrinsic()
+        cam_intrinsics = [self.cam.fx, self.cam.fy, self.cam.cx, self.cam.cy]
+        intrinsic.set_intrinsics(self.cam.W, self.cam.H, *cam_intrinsics)
+
+        # extrinsic = np.linalg.inv(cam_pose.cpu().numpy()).astype(np.float32)
+        # renderer.setup_camera(intrinsic, extrinsic)
+        
+        extrinsic = np.linalg.inv(self.cam.T.squeeze(0).cpu().numpy()).astype(np.float64)
+        renderer.setup_camera(intrinsic, extrinsic)
+
+        color = renderer.render_to_image()
+        depth = renderer.render_to_depth_image(z_in_view_space=True)
+
+        color_np = np.asarray(color)
+        depth_np = np.asarray(depth)
+
+        cv2.imshow("RGB", color_np)
+        cv2.imshow("Depth", depth_np)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+        return
+
+    def render_mesh_from_pose(self, mesh, fx, fy, cx, cy, width, height, extrinsic_w2c):
+        """
+        mesh: Open3D mesh or Trimesh mesh
+        extrinsic_w2c: 4x4 numpy world->camera matrix
+        """
+
+        # --- Convert Open3D mesh to Trimesh if necessary ---
+        if isinstance(mesh, o3d.geometry.TriangleMesh):
+            vertices = np.asarray(mesh.vertices)
+            faces = np.asarray(mesh.triangles)
+            mesh_tm = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        else:
+            mesh_tm = mesh
+
+        # --- Build pyrender scene ---
+        scene = pyrender.Scene()
+
+        mesh_node = pyrender.Mesh.from_trimesh(mesh_tm, smooth=True)
+        scene.add(mesh_node)
+
+        # --- Camera intrinsics ---
+        camera = pyrender.IntrinsicsCamera(
+            fx=fx, fy=fy, cx=cx, cy=cy,
+            znear=0.01, zfar=100.0
+        )
+
+        # --- Camera pose (note: pyrender expects camera-to-world) ---
+        cam_pose_c2w = np.linalg.inv(extrinsic_w2c.squeeze(0).detach().cpu().numpy())
+
+        scene.add(camera, pose=cam_pose_c2w)
+
+        # --- Offscreen renderer ---
+        r = pyrender.OffscreenRenderer(viewport_width=width, viewport_height=height)
+
+        color, depth = r.render(scene)  # CPU-only render
+
+        return color, depth
+
+
+
 def render_rgbd_from_obj(cam, obj_path):
     mesh = o3d.io.read_triangle_mesh(obj_path)
     if mesh.is_empty():
@@ -3047,28 +3261,32 @@ def render_rgbd_from_obj(cam, obj_path):
 
     return color_np, depth_np
 
+
 def init_cam():
 
     # For feature database training
-    # # Initialize Camera
-    # H = 1080
-    # W = 1920
-    # fx = fy = 1080
-    # near_plane, far_plane = 0.001, 100.0
-    # cam = Camera(H, W, fx, fy, near_plane, far_plane)
-
-
-    # For visual inspection and testing
     # Initialize Camera
-    H = 720
-    W = 1280
-    fx = fy = 912
+    H = 1080
+    W = 1920
+    fx = fy = 1080
     near_plane, far_plane = 0.001, 100.0
     cam = Camera(H, W, fx, fy, near_plane, far_plane)
+
+
+    # # For visual inspection and testing
+    # # Initialize Camera
+    # H = 720
+    # W = 1280
+    # fx = fy = 912
+    # near_plane, far_plane = 0.001, 100.0
+    # cam = Camera(H, W, fx, fy, near_plane, far_plane)
     
 
     # Track position and orientation of the camera over time
     tx, ty, tz, roll, pitch, yaw = 0, 0, 0, 0, 0, 0
+
+
+    tx, ty, tz, roll, pitch, yaw = 0, 0, 0, 0, -180, -90
 
     # # Use this initialization for the VR app (Ground floor origin near stairs)
     # tx, ty, tz = 2, -1, 1
@@ -3079,9 +3297,9 @@ def init_cam():
     # roll, pitch, yaw = 0, -90, -90
 
 
-    # Use this initialization for the VR app (first floor ARTLABS)
-    tx, ty, tz = -25.3, -0.08, 5.09 
-    roll, pitch, yaw = 0, -180, -90
+    # # Use this initialization for the VR app (first floor ARTLABS)
+    # tx, ty, tz = -25.3, -0.08, 5.09 
+    # roll, pitch, yaw = 0, -180, -90
 
     cam.set_camera_viewpoint(tx, ty, tz, roll, pitch, yaw)
 
@@ -3318,15 +3536,47 @@ def edit_gaussians_main(sh_degree, ply_file_path, out_dir):
 
 
 
+def mesh_from_gaussians_main(sh_degree, ply_file_path, out_dir):
+    
+    gaussian_model = GaussianModel(sh_degree, ply_file_path)
+    
+    #record_mode = Record_Mode.CONTINUE
+    record_mode = Record_Mode.PAUSE
+
+    recorder = Recorder(out_dir, record_mode)
+
+    cam = init_cam()
+
+    splat_app = SPLAT_APP(cam, gaussian_model, recorder)
+
+    splat_app.construct_mesh_from_depth_map_folder()
+
+
+    color, depth = render_rgbd_from_obj(cam,"/root/code/ubuntu_data/code_outputs/test_trajectory1/mesh.obj")
+    cv2.imshow("RGB", color)
+    cv2.imshow("Depth", depth)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+
+    color, depth = render_rgbd_from_obj(cam,"/root/code/ubuntu_data/datasets/ARTLab_Splat/Mesh_Files/Manual_Map_Fusion_Room.obj")
+    cv2.imshow("RGB", color)
+    cv2.imshow("Depth", depth)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+
 def main():
 
     # sh_degree = 3
     # ply_file_path="/root/code/extra1/datasets/ARTGarage/xgrids/4/Gaussian/PLY_Generic_splats_format/point_cloud/iteration_100/point_cloud.ply"
 
-    sh_degree = 3
-    #ply_file_path="/root/code/datasets/xgrids/LCC_output/AG_Office/ply-result/point_cloud/iteration_100/point_cloud.ply"
-    ply_file_path="/root/code/ubuntu_data/datasets/ARTGarage/lab_office_in_out_k1_scanner/output/LCC_Studio_GaussianSplat_out/AG_Office/ply-result/point_cloud/iteration_100/point_cloud.ply"
-    #ply_file_path="/root/code/ubuntu_data/datasets/ARTGarage/ARTLabs/output/ply-result/point_cloud/iteration_100/point_cloud.ply"
+    # sh_degree = 3
+    # #ply_file_path="/root/code/datasets/xgrids/LCC_output/AG_Office/ply-result/point_cloud/iteration_100/point_cloud.ply"
+    # ply_file_path="/root/code/ubuntu_data/datasets/ARTGarage/lab_office_in_out_k1_scanner/output/LCC_Studio_GaussianSplat_out/AG_Office/ply-result/point_cloud/iteration_100/point_cloud.ply"
+    # #ply_file_path="/root/code/ubuntu_data/datasets/ARTGarage/ARTLabs/output/ply-result/point_cloud/iteration_100/point_cloud.ply"
 
 
     # sh_degree = 3
@@ -3335,7 +3585,11 @@ def main():
     #sh_degree = 0
     #ply_file_path="/root/code/datasets/xgrids/LCC_output/portal_cam_output_LCC/output/ply-result/point_cloud/iteration_100/point_cloud_1.ply"
 
-    out_dir = Path("/root/code/output/segmentation_testing/")
+
+    sh_degree = 0
+    ply_file_path="/root/code/ubuntu_data/datasets/ARTLab_Splat/point_cloud/iteration_100/point_cloud.ply"
+
+    out_dir = Path("/root/code/ubuntu_data/code_outputs/test_trajectory1/")
 
     # First perform VR walk through (disable segmentation inside vr walkthrough rasterizer as well) and record a trajectory
     # Then run calculate gaussian feature field for segmenting the images recorded
@@ -3343,13 +3597,16 @@ def main():
     # Run AnyLabel to improve annotation performance
     # Enable feature field calculation if you want to lift the segmentation into the Gaussians via backpropagation
 
-    # if 1:
-    #     splat_app_main(sh_degree, ply_file_path, out_dir)
-    # else:
-    #     calculate_gaussian_feature_field_main(sh_degree, ply_file_path, out_dir)
+    if 1:
+        splat_app_main(sh_degree, ply_file_path, out_dir)
+    else:
+        calculate_gaussian_feature_field_main(sh_degree, ply_file_path, out_dir)
 
 
-    edit_gaussians_main(sh_degree, ply_file_path, out_dir)
+    # edit_gaussians_main(sh_degree, ply_file_path, out_dir)
+
+
+    mesh_from_gaussians_main(sh_degree, ply_file_path, out_dir)
 
 
 if __name__ == "__main__":
