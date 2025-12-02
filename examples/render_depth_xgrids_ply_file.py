@@ -43,6 +43,10 @@ from tqdm import tqdm
 
 import trimesh
 import pyrender
+from transformers import pipeline
+from depth_anything_3.api import DepthAnything3
+from PIL import Image
+
 
 def conic_to_ellipse(conic, mean, scale=1.0, num_pts=60):
     """
@@ -2727,7 +2731,12 @@ class SPLAT_APP:
         pos_points = []
         neg_points = []
         device="cuda"
+        #device = torch.device("cuda")
         dtype=torch.bfloat16
+
+        model = DepthAnything3.from_pretrained("depth-anything/DA3NESTED-GIANT-LARGE")
+        model = model.to(device=device)
+
 
         while running:
             for event in pygame.event.get():
@@ -2792,6 +2801,12 @@ class SPLAT_APP:
                 grab_cam_pose = False
 
             rgb_vis_3dgs_bgr, rgb_vis_3dgs, rendered_depth_3dgs, depth_vis_3dgs = self.rasterize_images()
+
+            # # Generate depth map using depth anything V3
+            # pil_img = Image.fromarray(rgb_vis_3dgs.astype(np.uint8))
+            # prediction = model.inference([pil_img])
+            # rendered_depth_3dgs = prediction.depth[0]
+
 
             if record_mode in [Record_Mode.RECORD, Record_Mode.CONTINUE]:
                 self.recorder.record(rgb=rgb_vis_3dgs_bgr, depth=rendered_depth_3dgs, norm_depth=depth_vis_3dgs, pose=pose)
@@ -3589,7 +3604,7 @@ def main():
     sh_degree = 0
     ply_file_path="/root/code/ubuntu_data/datasets/ARTLab_Splat/point_cloud/iteration_100/point_cloud.ply"
 
-    out_dir = Path("/root/code/ubuntu_data/code_outputs/test_trajectory1/")
+    out_dir = Path("/root/code/ubuntu_data/code_outputs/test_trajectory/")
 
     # First perform VR walk through (disable segmentation inside vr walkthrough rasterizer as well) and record a trajectory
     # Then run calculate gaussian feature field for segmenting the images recorded
